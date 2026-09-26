@@ -80,6 +80,5 @@ On Windows, the Settings page writes the JSON configuration under `%APPDATA%\Oyn
 MIT, (c) 2026 tacobellerontop-sudo. See [LICENSE](LICENSE).
 
 Parts of Oynx are vendored from, or adapted from, other MIT-licensed projects,
-and the bundled font is under the SIL Open Font License. Per-file attribution and
-the full upstream license texts are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) —
-including which specific changes Oynx made to the vendored files.
+and the bundled font is under the SIL Open Font License. Attribution is in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
