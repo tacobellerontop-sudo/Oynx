@@ -1,0 +1,171 @@
+name: Windows PR smoke test
+
+# Verifies on every pull request that Oynx still builds into a windowed
+# executable and that the GUI actually comes up. The build is heavy (eframe,
+# librespot, rodio, tokio) and the launch check needs a real Windows desktop,
+# so this runs on windows-latest only.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-pr-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Transient network failures while fetching crates are common on CI; retry
+  # instead of failing the whole build on one flaky request.
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  build-and-launch:
+    name: Build exe and confirm it opens
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Warm the cache even when a later step fails, so a broken build still
+          # leaves the dependency compilation for the next run to reuse.
+          cache-on-failure: true
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Verify the exe is a windowed app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $exe = 'target\release\oynx.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            Get-ChildItem -Path target\release -Filter '*.exe' -Recurse |
+              ForEach-Object { Write-Host "found: $($_.FullName)" }
+            throw "expected $exe to exist after cargo build --release"
+          }
+          # Both assert scripts signal via `exit`, so clear any inherited value
+          # first: an unset $LASTEXITCODE would otherwise look like a failure.
+          $global:LASTEXITCODE = 0
+          & .\scripts\assert-gui-subsystem.ps1 -Path $exe
+          if ($LASTEXITCODE -ne 0) { throw 'GUI subsystem check failed' }
+
+      - name: Launch the app and confirm the window appears
+        shell: pwsh
+        env:
+          # env_logger defaults to filtering everything below error, which
+          # would leave the captured log empty even on a broken startup.
+          RUST_LOG: info
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $exe = (Resolve-Path 'target\release\oynx.exe').Path
+          $stdout = Join-Path $env:RUNNER_TEMP 'oynx-stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'oynx-stderr.log'
+
+          # The release build has no console, but the inherited stderr handle
+          # still carries env_logger output, which is what makes a CI failure
+          # debuggable.
+          $app = Start-Process -FilePath $exe -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Write-Host "started oynx.exe as PID $($app.Id)"
+
+          try {
+            # Give it a moment to get past renderer and tray setup before
+            # asserting, so a slow cold start is not a false failure.
+            Start-Sleep -Seconds 8
+
+            if ($app.HasExited) {
+              Write-Host "--- exit code: $($app.ExitCode) ---"
+              Write-Host '--- stdout ---'
+              if (Test-Path $stdout) { Get-Content $stdout }
+              Write-Host '--- stderr ---'
+              if (Test-Path $stderr) { Get-Content $stderr | Select-Object -First 100 }
+              throw "oynx.exe exited during startup with code $($app.ExitCode)"
+            }
+
+            # Both assert scripts signal via `exit`, so clear any inherited
+            # value first to avoid reading a stale one.
+            $global:LASTEXITCODE = 0
+            & .\scripts\assert-window.ps1 -ProcessId $app.Id -ExpectedTitle 'Oynx' -TimeoutSeconds 60
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The app stayed alive but never showed an "Oynx" window.'
+            }
+
+            Write-Host "PASS: oynx.exe is running as PID $($app.Id) with its window up."
+          }
+          finally {
+            if (-not $app.HasExited) {
+              Write-Host 'stopping the app'
+              Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Report why the launch failed
+        if: failure()
+        shell: pwsh
+        run: |
+          $stderr = Join-Path $env:RUNNER_TEMP 'oynx-stderr.log'
+          $stdout = Join-Path $env:RUNNER_TEMP 'oynx-stdout.log'
+
+          foreach ($log in @($stdout, $stderr)) {
+            if ((Test-Path $log) -and (Get-Item $log).Length -gt 0) {
+              Write-Host "=== $log (first 200 lines of $((Get-Content $log).Count)) ==="
+              Get-Content $log -TotalCount 200 | Write-Host
+            }
+            elseif (Test-Path $log) {
+              Write-Host "=== $log is empty ==="
+            }
+            else {
+              Write-Host "=== $log was never created ==="
+            }
+          }
+
+          # A hard crash in a GUI-subsystem process leaves no console output,
+          # so ask Windows what actually killed it.
+          Write-Host '=== recent application error events ==='
+          $since = (Get-Date).AddMinutes(-15)
+          $events = Get-WinEvent -FilterHashtable @{
+              LogName   = 'Application'
+              StartTime = $since
+            } -ErrorAction SilentlyContinue |
+            Where-Object { $_.LevelDisplayName -in @('Error', 'Warning') } |
+            Select-Object -First 10
+
+          if ($events) {
+            $events | Format-List TimeCreated, ProviderName, Id, Message | Out-String | Write-Host
+          }
+          else {
+            Write-Host 'no application error events in the last 15 minutes'
+          }
+
+          # Startup problems in a headless session are often the tray icon or
+          # a missing audio endpoint; both are expected here, but a panic
+          # message is not.
+          Write-Host '=== audio devices on this runner ==='
+          Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue |
+            Select-Object Name, Status | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Upload the executable
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oynx-windows-${{ github.run_number }}
+          path: |
+            target/release/oynx.exe
+            ${{ runner.temp }}/oynx-stdout.log
+            ${{ runner.temp }}/oynx-stderr.log
+          # Warn rather than error: if the build step itself failed there is no
+          # exe to upload, and a second red X here would only obscure the real
+          # failure.
+          if-no-files-found: warn
+          retention-days: 14

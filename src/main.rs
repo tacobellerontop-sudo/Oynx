@@ -1,3 +1,8 @@
+// Release builds link against the Windows GUI subsystem so launching the app
+// never opens a console window behind it. Debug builds keep the console so
+// `cargo run` still shows env_logger output.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod audio;
 mod spotify;
 mod tray;
