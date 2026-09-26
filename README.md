@@ -70,3 +70,16 @@ Oynx also caches playlist, Liked Songs, and recommendation responses briefly and
 The Web API transport/cache design was adapted from the MIT-licensed [MYX](https://github.com/HaseebKhalid1507/Myx) player. The ten-band equaliser (`src/audio/equalizer.rs`) is vendored from MYX (MIT, (c) 2026 Haseeb Khalid), and the spectrum analyser behind the Now Playing waveform (`src/audio/visualizer.rs`) is vendored from MYX, which adapted it from [spotify-player](https://github.com/aome510/spotify-player) (MIT, (c) 2021 Thang Pham). The queue-panel layout, compact navigation, and dark visual system were inspired by the MIT-licensed [Spotifast](https://github.com/crmne/spotifast) client. The bundled Inter font is distributed under the SIL Open Font License; see `assets/fonts/Inter-LICENSE.txt`.
 
 On Windows, the Settings page writes the JSON configuration under `%APPDATA%\Oynx\config.json`; Librespot credentials, the cached Web API token, cached responses, album artwork, session resume state, and audio files remain under `%LOCALAPPDATA%\Oynx\librespot`.
+
+## Building on CI
+
+`.github/workflows/windows-pr.yml` runs on every pull request. It builds the release executable, asserts the binary is linked against the Windows GUI subsystem (so no console window appears), then launches it and confirms a top-level `Oynx` window is actually created before uploading the exe as an artifact.
+
+## License
+
+MIT, (c) 2026 tacobellerontop-sudo. See [LICENSE](LICENSE).
+
+Parts of Oynx are vendored from, or adapted from, other MIT-licensed projects,
+and the bundled font is under the SIL Open Font License. Per-file attribution and
+the full upstream license texts are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) —
+including which specific changes Oynx made to the vendored files.
