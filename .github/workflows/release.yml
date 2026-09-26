@@ -1,0 +1,203 @@
+name: Publish release
+
+# Builds the release executable and attaches it to a GitHub release whenever a
+# version tag is pushed. The binary is verified before it is published: same
+# GUI-subsystem and live-window checks as the pull request workflow, so a tag
+# can never ship an exe that opens a console or dies on startup.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish a release for, e.g. v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  publish:
+    name: Build and attach the release exe
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve the tag
+        id: tag
+        shell: pwsh
+        env:
+          # Only set on workflow_dispatch; on a tag push GITHUB_REF_NAME is
+          # authoritative and this stays empty.
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $env:DISPATCH_TAG
+          }
+          else {
+            $env:GITHUB_REF_NAME
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw 'could not determine which tag to publish'
+          }
+
+          # A typo here would create a release that no Cargo.toml version
+          # corresponds to, so refuse rather than guess.
+          $version = $tag -replace '^v', ''
+          $declared = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($declared -ne $version) {
+            throw "tag '$tag' does not match the version '$declared' in Cargo.toml"
+          }
+
+          Write-Host "publishing $tag (Cargo.toml version $declared)"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Verify the exe is a windowed app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $exe = 'target\release\oynx.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            Get-ChildItem -Path target\release -Filter '*.exe' -Recurse |
+              ForEach-Object { Write-Host "found: $($_.FullName)" }
+            throw "expected $exe to exist after cargo build --release"
+          }
+          $global:LASTEXITCODE = 0
+          & .\scripts\assert-gui-subsystem.ps1 -Path $exe
+          if ($LASTEXITCODE -ne 0) { throw 'GUI subsystem check failed' }
+
+      - name: Launch the app and confirm the window appears
+        shell: pwsh
+        env:
+          RUST_LOG: info
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $exe = (Resolve-Path 'target\release\oynx.exe').Path
+          $stdout = Join-Path $env:RUNNER_TEMP 'oynx-stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'oynx-stderr.log'
+
+          $app = Start-Process -FilePath $exe -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Write-Host "started oynx.exe as PID $($app.Id)"
+
+          try {
+            Start-Sleep -Seconds 8
+
+            if ($app.HasExited) {
+              Write-Host "--- exit code: $($app.ExitCode) ---"
+              if (Test-Path $stderr) { Get-Content $stderr -TotalCount 100 | Write-Host }
+              throw "oynx.exe exited during startup with code $($app.ExitCode)"
+            }
+
+            $global:LASTEXITCODE = 0
+            & .\scripts\assert-window.ps1 -ProcessId $app.Id -ExpectedTitle 'Oynx' -TimeoutSeconds 60
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The app stayed alive but never showed an "Oynx" window.'
+            }
+
+            Write-Host "PASS: oynx.exe is running as PID $($app.Id) with its window up."
+          }
+          finally {
+            if (-not $app.HasExited) {
+              Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Report why the build failed
+        if: failure()
+        shell: pwsh
+        run: |
+          $stderr = Join-Path $env:RUNNER_TEMP 'oynx-stderr.log'
+          if ((Test-Path $stderr) -and (Get-Item $stderr).Length -gt 0) {
+            Write-Host "=== oynx stderr ==="
+            Get-Content $stderr -TotalCount 200 | Write-Host
+          }
+          Write-Host '=== recent application error events ==='
+          Get-WinEvent -FilterHashtable @{
+              LogName   = 'Application'
+              StartTime = (Get-Date).AddMinutes(-15)
+            } -ErrorAction SilentlyContinue |
+            Where-Object { $_.LevelDisplayName -in @('Error', 'Warning') } |
+            Select-Object -First 10 |
+            Format-List TimeCreated, ProviderName, Id, Message |
+            Out-String | Write-Host
+
+      - name: Attach the exe to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # PowerShell 7.3+ turns a non-zero exit code from a native command
+          # into a terminating error under ErrorActionPreference Stop, which
+          # would make the "does this release already exist?" probe below throw
+          # instead of returning false.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $tag = $env:RELEASE_TAG
+          $version = $tag -replace '^v', ''
+
+          # Name the asset after the tag so a downloads folder holding several
+          # releases stays readable.
+          $asset = "oynx-$version-windows-x86_64.exe"
+          Copy-Item 'target\release\oynx.exe' $asset -Force
+
+          $digest = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
+          Write-Host "asset: $asset"
+          Write-Host "sha256: $digest"
+
+          # Built as an array rather than a here-string: this block is indented
+          # inside the YAML, and an indented here-string terminator is a parse
+          # error in Windows PowerShell.
+          $notes = @(
+            "SHA256 ($asset)"
+            ''
+            '```'
+            $digest
+            '```'
+            ''
+            'Requires Windows 10 or newer. The binary is not code-signed, so Windows'
+            'SmartScreen will warn about an unknown publisher; choose More info then'
+            'Run anyway. A Spotify Premium account is required, and Oynx never asks'
+            'for your Spotify password: sign-in runs through Spotify''s browser-based'
+            'OAuth flow with PKCE.'
+          ) -join [Environment]::NewLine
+
+          # gh ships on windows-latest, so this needs no third-party action.
+          # Re-running the workflow for a tag that already has a release should
+          # refresh the asset rather than fail.
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "release $tag already exists; replacing the asset"
+            gh release upload $tag $asset --clobber
+          }
+          else {
+            gh release create $tag $asset --verify-tag --title "Oynx $tag" --notes $notes
+          }
+
+          if ($LASTEXITCODE -ne 0) { throw "failed to publish $tag" }
+
+          Write-Host "published https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$tag"
