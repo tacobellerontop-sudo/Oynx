@@ -34,6 +34,11 @@ jobs:
     steps:
       - name: Checkout the tagged commit
         uses: actions/checkout@v4
+        with:
+          # On a tag push github.ref is already the tag. On workflow_dispatch the
+          # checkout would otherwise use the dispatch ref, which could build a
+          # commit that does not correspond to the tag being published.
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
