@@ -6,6 +6,7 @@
 mod audio;
 mod spotify;
 mod tray;
+mod updater;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use crate::spotify::{
 };
 use crate::audio::{AudioTaps, EQ_FREQUENCIES_HZ, EqualizerPreset, EqualizerSettings, MAX_EQ_GAIN_DB, MIN_EQ_GAIN_DB, NUM_BANDS, NUM_EQ_BANDS};
 use crate::tray::TrayAction;
+use crate::updater::{CURRENT_VERSION, UpdateMode, UpdateStatus, Updater};
 
 const INTER_FONT: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
 const FAMILY_MEDIUM: &str = "Inter Medium";
@@ -49,13 +51,23 @@ const RADIUS_MD: u8 = 8;
 const RADIUS_LG: u8 = 12;
 const SIDEBAR_WIDTH: f32 = 244.0;
 const QUEUE_PANEL_WIDTH: f32 = 360.0;
-const PLAYER_HEIGHT: f32 = 222.0;
+const PLAYER_HEIGHT: f32 = 150.0;
 const TITLE_BAR_HEIGHT: f32 = 60.0;
-const BOTTOM_STRIP_HEIGHT: f32 = 60.0;
+const BOTTOM_STRIP_HEIGHT: f32 = 50.0;
 /// Left inset of page content inside the central column.
 const CONTENT_INSET: f32 = 64.0;
 const TRACK_ROW_HEIGHT: f32 = 56.0;
-const WIDE_LAYOUT_MIN_WIDTH: f32 = 1120.0;
+const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 200.0..=380.0;
+const QUEUE_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 280.0..=520.0;
+const PLAYER_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 150.0..=300.0;
+/// The centre column never gets narrower than this; side panels give way first.
+const MIN_CENTRAL_WIDTH: f32 = 440.0;
+/// Content always keeps at least this much height above the player.
+const MIN_CONTENT_HEIGHT: f32 = 200.0;
+/// eframe storage key for [`UiPrefs`].
+const UI_PREFS_KEY: &str = "oynx_ui_prefs";
+/// How often automatic updates look for a new release.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Record spin speed while playing, in radians per second (about 18 rpm).
 const DISC_SPEED: f32 = std::f32::consts::TAU * 0.3;
 /// Frame interval while the record is spinning (about 30 fps).
@@ -92,6 +104,61 @@ impl Section {
             Self::Settings => "Settings",
         }
     }
+}
+
+/// User layout and update choices, saved through eframe's storage along with
+/// the window's size and position.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+struct UiPrefs {
+    sidebar_width: f32,
+    queue_width: f32,
+    player_height: f32,
+    update_mode: UpdateMode,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            sidebar_width: SIDEBAR_WIDTH,
+            queue_width: QUEUE_PANEL_WIDTH,
+            player_height: PLAYER_HEIGHT,
+            update_mode: UpdateMode::default(),
+        }
+    }
+}
+
+/// Section sizes that fit the current window. The saved preferences are not
+/// changed, so a larger window (or monitor) gets the preferred sizes back.
+#[derive(Clone, Copy)]
+struct Layout {
+    sidebar_width: f32,
+    queue_width: f32,
+    player_height: f32,
+    /// Whether the queue panel fits beside the centre column.
+    queue_fits: bool,
+}
+
+impl Layout {
+    fn fit(prefs: &UiPrefs, window: egui::Vec2) -> Self {
+        let clamp = |value: f32, range: &std::ops::RangeInclusive<f32>| value.clamp(*range.start(), *range.end());
+        let sidebar_width = clamp(prefs.sidebar_width, &SIDEBAR_WIDTH_RANGE)
+            .min(window.x - MIN_CENTRAL_WIDTH)
+            .max(*SIDEBAR_WIDTH_RANGE.start());
+        let queue_width = clamp(prefs.queue_width, &QUEUE_WIDTH_RANGE);
+        let queue_fits = window.x - sidebar_width - queue_width >= MIN_CENTRAL_WIDTH;
+        let body_height = window.y - TITLE_BAR_HEIGHT - BOTTOM_STRIP_HEIGHT;
+        let player_height = clamp(prefs.player_height, &PLAYER_HEIGHT_RANGE)
+            .min(body_height - MIN_CONTENT_HEIGHT)
+            .max(*PLAYER_HEIGHT_RANGE.start());
+        Self { sidebar_width, queue_width, player_height, queue_fits }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    General,
+    Updates,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -315,6 +382,12 @@ struct OynxApp {
     artwork_queue: VecDeque<(String, u32, u32, Vec<u8>)>,
     styled: bool,
     tray: Option<tray::Tray>,
+    prefs: UiPrefs,
+    settings_tab: SettingsTab,
+    updater: Updater,
+    started_at: Instant,
+    /// Size of the monitor the window was last on, to notice moves between monitors.
+    last_monitor_size: Option<egui::Vec2>,
     window_hidden: bool,
     quitting: bool,
     spotify: SpotifyClient,
@@ -614,6 +687,11 @@ impl OynxApp {
             artwork_queue: VecDeque::new(),
             styled: false,
             tray: None,
+            prefs: UiPrefs::default(),
+            settings_tab: SettingsTab::General,
+            updater: Updater::new(),
+            started_at: Instant::now(),
+            last_monitor_size: None,
             window_hidden: false,
             quitting: false,
             spotify: SpotifyClient::new(audio.clone()),
@@ -2736,6 +2814,148 @@ impl OynxApp {
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         Self::page_title(ui, "Settings");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for (tab, label) in [(SettingsTab::General, "General"), (SettingsTab::Updates, "Updates")] {
+                if chip(ui, label, self.settings_tab == tab).clicked() {
+                    self.settings_tab = tab;
+                }
+            }
+        });
+        ui.add_space(20.0);
+        match self.settings_tab {
+            SettingsTab::General => self.draw_general_settings(ui),
+            SettingsTab::Updates => self.draw_update_settings(ui),
+        }
+    }
+
+    fn draw_update_settings(&mut self, ui: &mut egui::Ui) {
+        let status = self.updater.status();
+        let blocker = updater::install_blocker();
+        let ctx = ui.ctx().clone();
+        let mut restart = false;
+        Self::settings_card(ui, "Updates", |ui| {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("Oynx {CURRENT_VERSION}"))
+                    .font(font_medium(15.0))
+                    .color(TEXT),
+            );
+            let checked = self.updater.last_checked().map(|at| {
+                let minutes = at.elapsed().as_secs() / 60;
+                match minutes {
+                    0 => "just now".to_owned(),
+                    1 => "1 minute ago".to_owned(),
+                    m if m < 60 => format!("{m} minutes ago"),
+                    m => format!("{} hours ago", m / 60),
+                }
+            });
+            let (line, color) = match &status {
+                UpdateStatus::Idle => (
+                    checked.map_or("Not checked yet".to_owned(), |when| format!("Last checked {when}")),
+                    MUTED,
+                ),
+                UpdateStatus::Checking => ("Checking for updates…".to_owned(), MUTED),
+                UpdateStatus::UpToDate => (
+                    format!("You're up to date · checked {}", checked.unwrap_or_else(|| "just now".to_owned())),
+                    MUTED,
+                ),
+                UpdateStatus::Available(release) => (format!("Version {} is available", release.version), TEXT),
+                UpdateStatus::Downloading { release, downloaded, total } => (
+                    format!(
+                        "Downloading {}… {:.0}%",
+                        release.version,
+                        *downloaded as f32 / (*total).max(1) as f32 * 100.0
+                    ),
+                    TEXT,
+                ),
+                UpdateStatus::Installed(release) => (
+                    format!("Version {} is installed. Restart Oynx to start using it.", release.version),
+                    TEXT,
+                ),
+                UpdateStatus::Failed(error) => (error.clone(), DANGER),
+            };
+            ui.label(egui::RichText::new(line).size(12.5).color(color));
+            if let UpdateStatus::Downloading { downloaded, total, .. } = &status {
+                ui.add_space(8.0);
+                let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(360.0), 3.0), egui::Sense::hover());
+                ui.painter().rect_filled(bar, 2, TEXT.gamma_multiply(0.15));
+                let mut filled = bar;
+                filled.set_right(bar.left() + bar.width() * (*downloaded as f32 / (*total).max(1) as f32).min(1.0));
+                ui.painter().rect_filled(filled, 2, TEXT);
+            }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| match &status {
+                UpdateStatus::Checking | UpdateStatus::Downloading { .. } => {
+                    pill_button(ui, "Working…", ButtonKind::Secondary);
+                }
+                UpdateStatus::Installed(_) => {
+                    restart = pill_button(ui, "Restart now", ButtonKind::Primary).clicked();
+                }
+                UpdateStatus::Available(release) => {
+                    if blocker.is_none()
+                        && pill_button(ui, &format!("Download and install {}", release.version), ButtonKind::Primary).clicked()
+                    {
+                        self.updater.install(&ctx, release.clone());
+                    }
+                    if pill_button(ui, "Release notes", ButtonKind::Ghost).clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(&release.page_url));
+                    }
+                }
+                _ => {
+                    if pill_button(ui, "Check for updates", ButtonKind::Primary).clicked() {
+                        self.updater.check(&ctx, false);
+                    }
+                    if pill_button(ui, "All releases", ButtonKind::Ghost).clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(updater::RELEASES_PAGE_URL));
+                    }
+                }
+            });
+            if let Some(reason) = &blocker {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(reason).size(12.0).color(SUBTLE));
+            }
+        });
+        if restart {
+            self.restart_to_update(&ctx);
+        }
+
+        ui.add_space(16.0);
+        Self::settings_card(ui, "Update mode", |ui| {
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for (mode, title, detail) in [
+                (
+                    UpdateMode::Automatic,
+                    "Automatic",
+                    "Check in the background and install new versions. They take effect the next time Oynx starts.",
+                ),
+                (
+                    UpdateMode::Manual,
+                    "Manual",
+                    "Only check when you press Check for updates, and choose when to install.",
+                ),
+            ] {
+                if option_row(ui, title, detail, self.prefs.update_mode == mode).clicked() {
+                    self.prefs.update_mode = mode;
+                }
+            }
+        });
+    }
+
+    /// Starts the freshly installed version and closes this one.
+    fn restart_to_update(&mut self, ctx: &egui::Context) {
+        match updater::launch_new_version() {
+            Ok(()) => {
+                self.save_session();
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => self.connection_error = Some(error),
+        }
+    }
+
+    fn draw_general_settings(&mut self, ui: &mut egui::Ui) {
         let connected = self.connection_state == ConnectionState::Ready;
         let mut account_action = false;
         Self::settings_card(ui, "Account", |ui| {
@@ -3029,6 +3249,20 @@ impl OynxApp {
             7.0,
         );
 
+        if let UpdateStatus::Installed(release) = self.updater.status() {
+            let pill = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - 36.0 - 2.0 * 54.0 - 30.0 - 170.0, rect.center().y - 15.0),
+                egui::vec2(170.0, 30.0),
+            );
+            let mut pill_ui = ui.new_child(egui::UiBuilder::new().max_rect(pill));
+            if pill_button(&mut pill_ui, "Restart to update", ButtonKind::Secondary)
+                .on_hover_text(format!("Oynx {} is installed", release.version))
+                .clicked()
+            {
+                self.restart_to_update(&ctx);
+            }
+        }
+
         let size = egui::vec2(46.0, 34.0);
         let buttons = [
             (Icon::Close, "Close", 0),
@@ -3197,7 +3431,9 @@ impl OynxApp {
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        let disc_radius = ((rect.width() - 36.0) * 0.5).min(104.0);
+        let disc_radius = ((rect.width() - 36.0) * 0.5)
+            .min(120.0)
+            .min(((rect.height() - 330.0) * 0.5).max(56.0));
         let disc_center = egui::pos2(
             rect.left() + 18.0 + disc_radius,
             rect.bottom() - disc_radius - 14.0,
@@ -3723,6 +3959,9 @@ impl OynxApp {
     fn draw_player(&mut self, ui: &mut egui::Ui, rect: egui::Rect, wide_layout: bool) {
         let track = self.current_track().clone();
         let id = ui.id().with("player");
+        // The controls keep their natural spacing; extra height from resizing is
+        // shared evenly above and below them.
+        let top = rect.top() + ((rect.height() - PLAYER_HEIGHT) * 0.5).max(0.0);
 
         // Track info: the title and artist slide up into place on track change.
         let now = ui.input(|input| input.time);
@@ -3741,7 +3980,7 @@ impl OynxApp {
         let text_width = (rect.width() * 0.34).clamp(120.0, 260.0);
         let title = paint_text(
             ui.painter(),
-            egui::pos2(text_x, rect.top() + 36.0 + lift),
+            egui::pos2(text_x, top + 22.0 + lift),
             egui::Align2::LEFT_CENTER,
             &track.title,
             egui::FontId::proportional(16.0),
@@ -3750,7 +3989,7 @@ impl OynxApp {
         );
         let artist = paint_text(
             ui.painter(),
-            egui::pos2(text_x, rect.top() + 62.0 + lift * 1.5),
+            egui::pos2(text_x, top + 44.0 + lift * 1.5),
             egui::Align2::LEFT_CENTER,
             &track.artist,
             egui::FontId::proportional(13.0),
@@ -3761,7 +4000,7 @@ impl OynxApp {
         let liked = self
             .current_track_id()
             .is_some_and(|track_id| self.liked_song_ids.contains(&track_id));
-        let heart = egui::Rect::from_center_size(egui::pos2(heart_x, rect.top() + 40.0), egui::vec2(34.0, 34.0));
+        let heart = egui::Rect::from_center_size(egui::pos2(heart_x, top + 32.0), egui::vec2(32.0, 32.0));
         if icon_button_at(
             ui,
             id.with("like"),
@@ -3811,7 +4050,7 @@ impl OynxApp {
         // Progress
         let bar_left = rect.left() + (rect.width() * 0.26).clamp(26.0, 204.0);
         let bar_right = rect.right() - 38.0;
-        let bar_y = rect.top() + 112.0;
+        let bar_y = top + 76.0;
         let hit = egui::Rect::from_min_max(egui::pos2(bar_left, bar_y - 8.0), egui::pos2(bar_right, bar_y + 8.0));
         let bar_hover = animate(ui, id.with("progress_hover"), ui.rect_contains_pointer(hit), ANIM_FAST);
         // Glide on large jumps (new track, resume); regular ticks snap.
@@ -3833,14 +4072,14 @@ impl OynxApp {
             .circle_filled(egui::pos2(knob_x, bar_y), 4.5 + 1.5 * bar_hover, TEXT);
         let time_font = egui::FontId::proportional(12.0);
         ui.painter().text(
-            egui::pos2(bar_left, bar_y + 20.0),
+            egui::pos2(bar_left, bar_y + 15.0),
             egui::Align2::LEFT_CENTER,
             format_duration(self.position_ms.min(track.duration_ms())),
             time_font.clone(),
             MUTED,
         );
         ui.painter().text(
-            egui::pos2(bar_right, bar_y + 20.0),
+            egui::pos2(bar_right, bar_y + 15.0),
             egui::Align2::RIGHT_CENTER,
             &track.duration,
             time_font,
@@ -3849,9 +4088,9 @@ impl OynxApp {
 
         // Transport
         let center_x = (bar_left + bar_right) * 0.5;
-        let controls_y = rect.top() + 182.0;
+        let controls_y = top + 118.0;
         let spread = ((bar_right - bar_left) / 620.0).clamp(0.62, 1.0);
-        let small = egui::vec2(38.0, 38.0);
+        let small = egui::vec2(34.0, 34.0);
         let repeat_icon = if self.repeat == RepeatMode::One {
             Icon::RepeatOne
         } else {
@@ -3870,13 +4109,13 @@ impl OynxApp {
         {
             self.previous_track();
         }
-        let play_rect = egui::Rect::from_center_size(egui::pos2(center_x, controls_y), egui::vec2(58.0, 58.0));
+        let play_rect = egui::Rect::from_center_size(egui::pos2(center_x, controls_y), egui::vec2(46.0, 46.0));
         let play = ui
             .interact(play_rect, id.with("play"), egui::Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         let play_hover = hover_t(ui, &play);
         let play_press = press_t(ui, &play);
-        let play_radius = 28.0 + play_hover - 1.5 * play_press;
+        let play_radius = 22.0 + play_hover - 1.5 * play_press;
         if play_hover > 0.0 {
             ui.painter().circle_filled(
                 play_rect.center(),
@@ -4241,7 +4480,10 @@ impl OynxApp {
 
         ui.painter()
             .rect_filled(ui.ctx().viewport_rect(), 0, BACKGROUND);
-        let wide_layout = ui.ctx().viewport_rect().width() >= WIDE_LAYOUT_MIN_WIDTH;
+        self.fit_window_to_monitor(ui.ctx());
+        let viewport = ui.ctx().viewport_rect();
+        let layout = Layout::fit(&self.prefs, viewport.size());
+        let wide_layout = layout.queue_fits;
         self.advance_disc();
         let plain = egui::Frame::new().fill(BACKGROUND);
 
@@ -4258,7 +4500,7 @@ impl OynxApp {
             .show(ui, |ui| self.draw_bottom_strip(ui, wide_layout));
 
         egui::Panel::left("sidebar")
-            .exact_size(SIDEBAR_WIDTH)
+            .exact_size(layout.sidebar_width)
             .resizable(false)
             .show_separator_line(false)
             .frame(plain)
@@ -4266,12 +4508,13 @@ impl OynxApp {
 
         // The queue slides in and out rather than popping.
         let mut panel_open = self.queue_panel_visible && wide_layout;
-        egui::Panel::right("queue_panel")
-            .exact_size(QUEUE_PANEL_WIDTH)
+        let queue_panel = egui::Panel::right("queue_panel")
+            .exact_size(layout.queue_width)
             .resizable(false)
             .show_separator_line(false)
             .frame(plain)
-            .show_collapsible(ui, &mut panel_open, |ui| self.draw_queue_panel(ui));
+            .show_collapsible(ui, &mut panel_open, |ui| self.draw_queue_panel(ui))
+            .map(|shown| shown.response.rect);
 
         // Fade and lift the page in whenever the user navigates somewhere new.
         let page_key = (self.section, self.playlist_name.clone());
@@ -4285,12 +4528,12 @@ impl OynxApp {
             ui.ctx().request_repaint();
         }
 
-        egui::CentralPanel::default()
+        let central = egui::CentralPanel::default()
             .frame(plain)
             .show(ui, |ui| {
                 let rect = ui.max_rect();
                 let player_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left(), rect.bottom() - PLAYER_HEIGHT),
+                    egui::pos2(rect.left(), rect.bottom() - layout.player_height),
                     rect.max,
                 );
                 // Leave room on the right so floating scroll bars sit beside the content.
@@ -4330,9 +4573,84 @@ impl OynxApp {
                         });
                 }
                 self.draw_player(ui, player_rect, wide_layout);
-            });
+            })
+            .response
+            .rect;
 
+        self.draw_splitters(ui, &layout, central, queue_panel);
         Self::handle_resize_edges(ui);
+    }
+
+    /// Drag handles between the sections. Dragging resizes and saves the
+    /// preference; double-clicking restores the default size.
+    fn draw_splitters(
+        &mut self,
+        ui: &egui::Ui,
+        layout: &Layout,
+        central: egui::Rect,
+        queue_panel: Option<egui::Rect>,
+    ) {
+        let top = central.top();
+        let bottom = central.bottom();
+        let player_top = central.bottom() - layout.player_height;
+
+        let sidebar_x = central.left();
+        if let Some(pointer) = splitter(ui, "sidebar", egui::Rect::from_min_max(
+            egui::pos2(sidebar_x - 4.0, top),
+            egui::pos2(sidebar_x + 4.0, bottom),
+        ), true, &mut self.prefs.sidebar_width, SIDEBAR_WIDTH) {
+            self.prefs.sidebar_width = (pointer.x - ui.ctx().viewport_rect().left())
+                .clamp(*SIDEBAR_WIDTH_RANGE.start(), *SIDEBAR_WIDTH_RANGE.end());
+        }
+
+        if let Some(queue) = queue_panel.filter(|rect| (rect.width() - layout.queue_width).abs() < 1.0) {
+            let queue_x = queue.left();
+            if let Some(pointer) = splitter(ui, "queue", egui::Rect::from_min_max(
+                egui::pos2(queue_x - 4.0, top),
+                egui::pos2(queue_x + 4.0, bottom),
+            ), true, &mut self.prefs.queue_width, QUEUE_PANEL_WIDTH) {
+                self.prefs.queue_width = (ui.ctx().viewport_rect().right() - pointer.x)
+                    .clamp(*QUEUE_WIDTH_RANGE.start(), *QUEUE_WIDTH_RANGE.end());
+            }
+        }
+
+        if let Some(pointer) = splitter(ui, "player", egui::Rect::from_min_max(
+            egui::pos2(central.left(), player_top - 4.0),
+            egui::pos2(central.right(), player_top + 4.0),
+        ), false, &mut self.prefs.player_height, PLAYER_HEIGHT) {
+            self.prefs.player_height = (central.bottom() - pointer.y)
+                .clamp(*PLAYER_HEIGHT_RANGE.start(), *PLAYER_HEIGHT_RANGE.end());
+        }
+    }
+
+    /// Keeps the window usable after it moves to another monitor: if it no
+    /// longer fits (a smaller screen, or a higher display scale), shrink it.
+    fn fit_window_to_monitor(&mut self, ctx: &egui::Context) {
+        let (monitor, inner, maximized, fullscreen) = ctx.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.monitor_size,
+                viewport.inner_rect,
+                viewport.maximized.unwrap_or(false),
+                viewport.fullscreen.unwrap_or(false),
+            )
+        });
+        let (Some(monitor), Some(inner)) = (monitor, inner) else {
+            return;
+        };
+        if self.last_monitor_size == Some(monitor) {
+            return;
+        }
+        self.last_monitor_size = Some(monitor);
+        if maximized || fullscreen {
+            return;
+        }
+        // Leave room for the taskbar.
+        let limit = (monitor - egui::vec2(24.0, 64.0)).max(egui::vec2(760.0, 540.0));
+        let size = inner.size();
+        if size.x > limit.x || size.y > limit.y {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.min(limit)));
+        }
     }
 
     /// Non-drawing work: runs from `App::logic`, so it keeps going while the
@@ -4344,6 +4662,15 @@ impl OynxApp {
             self.last_session_save = Instant::now();
         }
         self.handle_tray(ctx);
+        if self.prefs.update_mode == UpdateMode::Automatic
+            && self.started_at.elapsed() > Duration::from_secs(15)
+            && self
+                .updater
+                .last_checked()
+                .is_none_or(|checked| checked.elapsed() >= UPDATE_CHECK_INTERVAL)
+        {
+            self.updater.check(ctx, true);
+        }
         if self.window_hidden {
             // No painting happens while hidden; just keep draining Spotify events.
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -4546,6 +4873,43 @@ fn spectrum_ticks(values: &[f32; NUM_BANDS], peak_envelope: f32, count: usize) -
     ticks
 }
 
+/// One section divider. Returns the pointer position while it is dragged.
+/// Hovering highlights the divider; double-clicking resets `value` to `default`.
+fn splitter(
+    ui: &egui::Ui,
+    name: &str,
+    zone: egui::Rect,
+    vertical: bool,
+    value: &mut f32,
+    default: f32,
+) -> Option<egui::Pos2> {
+    let response = ui
+        .interact(zone, egui::Id::new(("splitter", name)), egui::Sense::click_and_drag())
+        .on_hover_cursor(if vertical {
+            egui::CursorIcon::ResizeHorizontal
+        } else {
+            egui::CursorIcon::ResizeVertical
+        });
+    let active = response.hovered() || response.dragged();
+    let t = animate(ui, response.id.with("active"), active, ANIM_FAST);
+    if t > 0.0 {
+        let stroke = egui::Stroke::new(1.0 + t, TEXT.gamma_multiply(0.35 * t));
+        if vertical {
+            ui.painter().vline(zone.center().x, zone.y_range(), stroke);
+        } else {
+            ui.painter().hline(zone.x_range(), zone.center().y, stroke);
+        }
+    }
+    if response.double_clicked() {
+        *value = default;
+        return None;
+    }
+    if response.dragged() {
+        return response.interact_pointer_pos();
+    }
+    None
+}
+
 /// The frame shared by popup menus.
 fn menu_frame() -> egui::Frame {
     egui::Frame::new()
@@ -4651,6 +5015,37 @@ fn text_icon_button(ui: &mut egui::Ui, icon: Icon, text: &str) -> egui::Response
         font,
         color,
     );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A selectable row with a radio marker, a title, and a short description.
+fn option_row(ui: &mut egui::Ui, title: &str, detail: &str, selected: bool) -> egui::Response {
+    let width = ui.available_width();
+    let detail_galley = ui.painter().layout(
+        detail.to_owned(),
+        egui::FontId::proportional(12.0),
+        MUTED,
+        width - 64.0,
+    );
+    let height = 30.0 + detail_galley.size().y + 12.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let hover = hover_t(ui, &response);
+    if hover > 0.0 {
+        ui.painter().rect_filled(rect, RADIUS_MD, SURFACE_HOVER.gamma_multiply(0.6 * hover));
+    }
+    let marker = egui::pos2(rect.left() + 22.0, rect.top() + 21.0);
+    ui.painter().circle_stroke(marker, 8.0, egui::Stroke::new(1.3, if selected { TEXT } else { MUTED }));
+    if selected {
+        ui.painter().circle_filled(marker, 4.0, TEXT);
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 44.0, marker.y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        font_medium(14.0),
+        TEXT,
+    );
+    ui.painter().galley(egui::pos2(rect.left() + 44.0, rect.top() + 33.0), detail_galley, MUTED);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -5019,6 +5414,15 @@ impl Drop for OynxApp {
 }
 
 impl eframe::App for OynxApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, UI_PREFS_KEY, &self.prefs);
+    }
+
+    /// Popups and scroll positions should start fresh on each launch.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick(ctx);
     }
@@ -5033,13 +5437,14 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 900.0])
-            .with_min_inner_size([1000.0, 700.0])
+            .with_min_inner_size([760.0, 540.0])
             .with_decorations(false)
             .with_icon(egui::IconData {
                 rgba: tray::app_icon_rgba(64),
                 width: 64,
                 height: 64,
             }),
+        persist_window: true,
         ..Default::default()
     };
 
@@ -5051,6 +5456,9 @@ fn main() -> eframe::Result {
             OynxApp::apply_style(&cc.egui_ctx);
             let mut app = OynxApp::new();
             app.styled = true;
+            if let Some(prefs) = cc.storage.and_then(|storage| eframe::get_value::<UiPrefs>(storage, UI_PREFS_KEY)) {
+                app.prefs = prefs;
+            }
             // Without a tray icon, closing the window quits as usual.
             match tray::Tray::new(&cc.egui_ctx) {
                 Ok(tray) => app.tray = Some(tray),

@@ -198,6 +198,10 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "release $tag already exists; replacing the asset"
             gh release upload $tag $asset --clobber
+            if ($LASTEXITCODE -ne 0) { throw "failed to replace the asset for $tag" }
+            # The notes carry the checksum the in-app updater verifies, so they
+            # must describe the asset that was just uploaded.
+            gh release edit $tag --notes $notes
           }
           else {
             gh release create $tag $asset --verify-tag --title "Oynx $tag" --notes $notes
