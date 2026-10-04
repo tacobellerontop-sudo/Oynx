@@ -1,13 +1,14 @@
-//! Checks GitHub Releases for a newer Oynx and installs it in place.
+//! Checks GitHub Releases for a newer Oynx and installs it.
 //!
 //! Releases are published by `.github/workflows/release.yml`, which attaches
-//! `oynx-<version>-windows-x86_64.exe` and records its SHA-256 in the release
-//! notes. An update is only installed if that checksum matches.
+//! the installer `oynx-<version>-windows-x86_64-setup.exe` and records its
+//! SHA-256 in the release notes. An update is only installed if that checksum
+//! matches.
 //!
-//! Installing swaps the executable on disk: Windows lets a running exe be
-//! renamed (not deleted), so the current file moves aside to `*.exe.old` and the
-//! download takes its name. The new version runs from the next launch; the old
-//! file is removed at startup.
+//! The verified installer is saved to the temp folder and run silently when
+//! Oynx quits, so the new version starts next time. "Restart now" runs it
+//! straight away instead, and the installer starts the new version when it
+//! finishes. See `installer/oynx.iss` for the command-line switches.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -52,8 +53,8 @@ pub enum UpdateStatus {
         downloaded: u64,
         total: u64,
     },
-    /// Installed on disk; restarting runs the new version.
-    Installed(Release),
+    /// The installer is downloaded and verified; it runs when Oynx quits.
+    Ready(Release),
     Failed(String),
 }
 
@@ -66,14 +67,18 @@ impl UpdateStatus {
 pub struct Updater {
     status: Arc<Mutex<UpdateStatus>>,
     last_checked: Arc<Mutex<Option<Instant>>>,
+    /// The verified installer waiting to be run.
+    pending: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl Updater {
     pub fn new() -> Self {
-        remove_previous_version();
+        // Left behind by an update that has already been installed.
+        let _ = std::fs::remove_file(installer_path());
         Self {
             status: Arc::new(Mutex::new(UpdateStatus::Idle)),
             last_checked: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -93,6 +98,7 @@ impl Updater {
         }
         let status = Arc::clone(&self.status);
         let last_checked = Arc::clone(&self.last_checked);
+        let pending = Arc::clone(&self.pending);
         let ctx = ctx.clone();
         set(&status, &ctx, UpdateStatus::Checking);
         std::thread::spawn(move || {
@@ -103,7 +109,7 @@ impl Updater {
             match result {
                 Ok(release) if is_newer(&release.version, CURRENT_VERSION) => {
                     if install && install_blocker().is_none() {
-                        download_and_install(release, &status, &ctx);
+                        download_installer(release, &status, &pending, &ctx);
                     } else {
                         set(&status, &ctx, UpdateStatus::Available(release));
                     }
@@ -119,8 +125,36 @@ impl Updater {
             return;
         }
         let status = Arc::clone(&self.status);
+        let pending = Arc::clone(&self.pending);
         let ctx = ctx.clone();
-        std::thread::spawn(move || download_and_install(release, &status, &ctx));
+        std::thread::spawn(move || download_installer(release, &status, &pending, &ctx));
+    }
+
+    /// Runs the downloaded installer with its progress window showing; it
+    /// closes this copy of Oynx and starts the new version when it finishes.
+    pub fn install_now(&self) -> Result<(), String> {
+        let setup = self
+            .take_pending()
+            .ok_or_else(|| "No update has been downloaded yet.".to_owned())?;
+        run_installer(&setup, &["/SILENT", "/LAUNCH=1"])?;
+        if let Ok(mut status) = self.status.lock() {
+            *status = UpdateStatus::Idle;
+        }
+        Ok(())
+    }
+
+    /// Runs a downloaded installer without any window as Oynx quits, so the
+    /// new version is in place for the next start.
+    pub fn install_on_exit(&self) {
+        if let Some(setup) = self.take_pending() {
+            if let Err(error) = run_installer(&setup, &["/VERYSILENT", "/LAUNCH=0"]) {
+                log::warn!("{error}");
+            }
+        }
+    }
+
+    fn take_pending(&self) -> Option<PathBuf> {
+        self.pending.lock().ok().and_then(|mut pending| pending.take())
     }
 }
 
@@ -139,18 +173,25 @@ pub fn install_blocker() -> Option<String> {
         .is_some_and(|name| name == "target");
     in_target.then(|| {
         "This is a development build (run from Cargo's target folder), so updates are not installed here. \
-         Download the release exe to use automatic updates."
+         Install Oynx with the setup program from the releases page to get updates."
             .to_owned()
     })
 }
 
-/// Starts the installed version and returns once it has launched.
-pub fn launch_new_version() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    std::process::Command::new(exe)
+/// Where a downloaded installer waits until it is run.
+fn installer_path() -> PathBuf {
+    std::env::temp_dir().join("oynx-update-setup.exe")
+}
+
+/// Starts the installer and returns without waiting for it. The switches are
+/// Inno Setup's; `/LAUNCH` is read by `installer/oynx.iss`.
+fn run_installer(setup: &Path, mode: &[&str]) -> Result<(), String> {
+    std::process::Command::new(setup)
+        .args(mode)
+        .args(["/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"])
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("Could not start the new version: {error}"))
+        .map_err(|error| format!("Could not start the Oynx installer: {error}"))
 }
 
 fn set(status: &Mutex<UpdateStatus>, ctx: &eframe::egui::Context, value: UpdateStatus) {
@@ -201,7 +242,7 @@ fn latest_release() -> Result<Release, String> {
     let asset = release
         .assets
         .iter()
-        .find(|asset| asset.name.starts_with("oynx-") && asset.name.ends_with("-windows-x86_64.exe"))
+        .find(|asset| is_installer_asset(&asset.name))
         .ok_or_else(|| format!("Release {} has no Windows download yet.", release.tag_name))?;
     Ok(Release {
         version: release.tag_name.trim_start_matches('v').to_owned(),
@@ -210,6 +251,10 @@ fn latest_release() -> Result<Release, String> {
         asset_size: asset.size,
         sha256: release.body.as_deref().and_then(find_sha256),
     })
+}
+
+fn is_installer_asset(name: &str) -> bool {
+    name.starts_with("oynx-") && name.ends_with("-windows-x86_64-setup.exe")
 }
 
 /// The first 64-character hex string in the release notes.
@@ -241,16 +286,20 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
-fn download_and_install(release: Release, status: &Mutex<UpdateStatus>, ctx: &eframe::egui::Context) {
-    let result = (|| -> Result<(), String> {
+fn download_installer(
+    release: Release,
+    status: &Mutex<UpdateStatus>,
+    pending: &Mutex<Option<PathBuf>>,
+    ctx: &eframe::egui::Context,
+) {
+    let result = (|| -> Result<PathBuf, String> {
         if let Some(reason) = install_blocker() {
             return Err(reason);
         }
         let expected = release.sha256.clone().ok_or_else(|| {
             "This release does not list a SHA-256 checksum, so it was not installed.".to_owned()
         })?;
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-        let download = exe.with_file_name("oynx-update.download");
+        let download = installer_path();
 
         let mut response = http()?
             .get(&release.asset_url)
@@ -261,7 +310,7 @@ fn download_and_install(release: Release, status: &Mutex<UpdateStatus>, ctx: &ef
         }
         let total = response.content_length().unwrap_or(release.asset_size);
         let mut file = std::fs::File::create(&download).map_err(|error| {
-            format!("Could not write next to {}: {error}", exe.display())
+            format!("Could not save the update to {}: {error}", download.display())
         })?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0; 64 * 1024];
@@ -291,36 +340,16 @@ fn download_and_install(release: Release, status: &Mutex<UpdateStatus>, ctx: &ef
             let _ = std::fs::remove_file(&download);
             return Err("The download did not match the published checksum, so it was discarded.".to_owned());
         }
-        replace_executable(&exe, &download)
+        Ok(download)
     })();
     match result {
-        Ok(()) => set(status, ctx, UpdateStatus::Installed(release)),
+        Ok(setup) => {
+            if let Ok(mut pending) = pending.lock() {
+                *pending = Some(setup);
+            }
+            set(status, ctx, UpdateStatus::Ready(release));
+        }
         Err(error) => set(status, ctx, UpdateStatus::Failed(error)),
-    }
-}
-
-fn old_version_path(exe: &Path) -> PathBuf {
-    exe.with_extension("exe.old")
-}
-
-fn replace_executable(exe: &Path, download: &Path) -> Result<(), String> {
-    let old = old_version_path(exe);
-    let _ = std::fs::remove_file(&old);
-    std::fs::rename(exe, &old)
-        .map_err(|error| format!("Could not move the current version aside: {error}"))?;
-    if let Err(error) = std::fs::rename(download, exe) {
-        // Put the running version back so the next launch still works.
-        let _ = std::fs::rename(&old, exe);
-        return Err(format!("Could not install the new version: {error}"));
-    }
-    Ok(())
-}
-
-/// Removes the previous executable left behind by an update.
-fn remove_previous_version() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::fs::remove_file(old_version_path(&exe));
-        let _ = std::fs::remove_file(exe.with_file_name("oynx-update.download"));
     }
 }
 
@@ -340,25 +369,15 @@ mod tests {
     }
 
     #[test]
-    fn install_swaps_the_executable_and_keeps_the_old_one_aside() {
-        let dir = std::env::temp_dir().join(format!("oynx-updater-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("oynx.exe");
-        let download = dir.join("oynx-update.download");
-        std::fs::write(&exe, b"old version").unwrap();
-        std::fs::write(&download, b"new version").unwrap();
-
-        replace_executable(&exe, &download).unwrap();
-
-        assert_eq!(std::fs::read(&exe).unwrap(), b"new version");
-        assert_eq!(std::fs::read(old_version_path(&exe)).unwrap(), b"old version");
-        assert!(!download.exists());
-        std::fs::remove_dir_all(&dir).unwrap();
+    fn only_the_installer_is_picked_as_the_update() {
+        assert!(is_installer_asset("oynx-0.1.3-windows-x86_64-setup.exe"));
+        assert!(!is_installer_asset("oynx-0.1.2-windows-x86_64.exe"));
+        assert!(!is_installer_asset("oynx-0.1.3-windows-x86_64-setup.exe.sha256"));
     }
 
     #[test]
     fn checksum_is_read_from_release_notes() {
-        let notes = "SHA256 (oynx-0.1.0-windows-x86_64.exe)\n\n```\nABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789\n```";
+        let notes = "SHA256 (oynx-0.1.3-windows-x86_64-setup.exe)\n\n```\nABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789\n```";
         assert_eq!(
             find_sha256(notes).as_deref(),
             Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
