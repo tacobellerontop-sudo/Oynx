@@ -2872,8 +2872,11 @@ impl OynxApp {
                     ),
                     TEXT,
                 ),
-                UpdateStatus::Installed(release) => (
-                    format!("Version {} is installed. Restart Oynx to start using it.", release.version),
+                UpdateStatus::Ready(release) => (
+                    format!(
+                        "Version {} is downloaded and installs when you quit Oynx, or restart now to update straight away.",
+                        release.version
+                    ),
                     TEXT,
                 ),
                 UpdateStatus::Failed(error) => (error.clone(), DANGER),
@@ -2892,7 +2895,7 @@ impl OynxApp {
                 UpdateStatus::Checking | UpdateStatus::Downloading { .. } => {
                     pill_button(ui, "Working…", ButtonKind::Secondary);
                 }
-                UpdateStatus::Installed(_) => {
+                UpdateStatus::Ready(_) => {
                     restart = pill_button(ui, "Restart now", ButtonKind::Primary).clicked();
                 }
                 UpdateStatus::Available(release) => {
@@ -2946,9 +2949,10 @@ impl OynxApp {
         });
     }
 
-    /// Starts the freshly installed version and closes this one.
+    /// Runs the downloaded installer and closes this copy; the installer starts
+    /// the new version when it finishes.
     fn restart_to_update(&mut self, ctx: &egui::Context) {
-        match updater::launch_new_version() {
+        match self.updater.install_now() {
             Ok(()) => {
                 self.save_session();
                 self.quitting = true;
@@ -3283,14 +3287,14 @@ impl OynxApp {
             7.0,
         );
 
-        if let UpdateStatus::Installed(release) = self.updater.status() {
+        if let UpdateStatus::Ready(release) = self.updater.status() {
             let pill = egui::Rect::from_min_size(
                 egui::pos2(rect.right() - 36.0 - 2.0 * 54.0 - 30.0 - 170.0, rect.center().y - 15.0),
                 egui::vec2(170.0, 30.0),
             );
             let mut pill_ui = ui.new_child(egui::UiBuilder::new().max_rect(pill));
             if pill_button(&mut pill_ui, "Restart to update", ButtonKind::Secondary)
-                .on_hover_text(format!("Oynx {} is installed", release.version))
+                .on_hover_text(format!("Oynx {} is ready to install", release.version))
                 .clicked()
             {
                 self.restart_to_update(&ctx);
@@ -5445,6 +5449,7 @@ fn format_duration(duration_ms: u32) -> String {
 impl Drop for OynxApp {
     fn drop(&mut self) {
         self.save_session();
+        self.updater.install_on_exit();
     }
 }
 

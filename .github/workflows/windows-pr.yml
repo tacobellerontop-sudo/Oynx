@@ -155,13 +155,34 @@ jobs:
           Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue |
             Select-Object Name, Status | Format-Table -AutoSize | Out-String | Write-Host
 
-      - name: Upload the executable
+      - name: Build the installer
+        id: installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $setup = & .\scripts\build-installer.ps1 -Exe target\release\oynx.exe -OutputDir dist
+          "setup=$setup" >> $env:GITHUB_OUTPUT
+
+      - name: Install and uninstall silently
+        shell: pwsh
+        env:
+          SETUP: ${{ steps.installer.outputs.setup }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $global:LASTEXITCODE = 0
+          & .\scripts\test-installer.ps1 -Setup $env:SETUP
+          if ($LASTEXITCODE -ne 0) { throw 'installer check failed' }
+
+      - name: Upload the executable and installer
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: oynx-windows-${{ github.run_number }}
           path: |
             target/release/oynx.exe
+            dist/*.exe
             ${{ runner.temp }}/oynx-stdout.log
             ${{ runner.temp }}/oynx-stderr.log
           # Warn rather than error: if the build step itself failed there is no

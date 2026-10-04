@@ -1,9 +1,11 @@
 name: Publish release
 
-# Builds the release executable and attaches it to a GitHub release whenever a
-# version tag is pushed. The binary is verified before it is published: same
-# GUI-subsystem and live-window checks as the pull request workflow, so a tag
-# can never ship an exe that opens a console or dies on startup.
+# Builds the release executable, packages it into the Windows installer, and
+# attaches the installer to a GitHub release whenever a version tag is pushed.
+# Everything is verified before it is published: the same GUI-subsystem,
+# live-window and silent install/uninstall checks as the pull request workflow,
+# so a tag can never ship an installer that fails or an app that opens a
+# console or dies on startup.
 on:
   push:
     tags: ['v*']
@@ -149,11 +151,32 @@ jobs:
             Format-List TimeCreated, ProviderName, Id, Message |
             Out-String | Write-Host
 
-      - name: Attach the exe to the release
+      - name: Build the installer
+        id: installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $setup = & .\scripts\build-installer.ps1 -Exe target\release\oynx.exe -OutputDir dist
+          "setup=$setup" >> $env:GITHUB_OUTPUT
+
+      - name: Install and uninstall silently
+        shell: pwsh
+        env:
+          SETUP: ${{ steps.installer.outputs.setup }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $global:LASTEXITCODE = 0
+          & .\scripts\test-installer.ps1 -Setup $env:SETUP
+          if ($LASTEXITCODE -ne 0) { throw 'installer check failed' }
+
+      - name: Attach the installer to the release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          SETUP: ${{ steps.installer.outputs.setup }}
         run: |
           $ErrorActionPreference = 'Stop'
           # PowerShell 7.3+ turns a non-zero exit code from a native command
@@ -165,10 +188,14 @@ jobs:
           $tag = $env:RELEASE_TAG
           $version = $tag -replace '^v', ''
 
-          # Name the asset after the tag so a downloads folder holding several
-          # releases stays readable.
-          $asset = "oynx-$version-windows-x86_64.exe"
-          Copy-Item 'target\release\oynx.exe' $asset -Force
+          # build-installer.ps1 names the installer after the Cargo.toml version,
+          # which the tag check above already matched to the tag. The in-app
+          # updater looks for exactly this name.
+          $asset = "oynx-$version-windows-x86_64-setup.exe"
+          if ((Split-Path -Leaf $env:SETUP) -ne $asset) {
+            throw "expected the installer to be named $asset, got $env:SETUP"
+          }
+          Copy-Item $env:SETUP $asset -Force
 
           $digest = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
           Write-Host "asset: $asset"
@@ -184,7 +211,12 @@ jobs:
             $digest
             '```'
             ''
-            'Requires Windows 10 or newer. The binary is not code-signed, so Windows'
+            'Download and run the installer. It installs Oynx for your account only'
+            '(no administrator rights needed) and adds it to the Start menu; Oynx'
+            'keeps itself up to date from then on, and it can be removed from'
+            'Settings > Apps.'
+            ''
+            'Requires Windows 10 or newer. The installer is not code-signed, so Windows'
             'SmartScreen will warn about an unknown publisher; choose More info then'
             'Run anyway. A Spotify Premium account is required, and Oynx never asks'
             'for your Spotify password: sign-in runs through Spotify''s browser-based'

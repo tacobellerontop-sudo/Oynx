@@ -2,6 +2,14 @@
 
 Oynx is a Rust desktop Spotify client built with eframe/egui and Librespot.
 
+## Install
+
+Download `oynx-<version>-windows-x86_64-setup.exe` from the [releases page](https://github.com/tacobellerontop-sudo/Oynx/releases) and run it. Oynx installs for your account only, under `%LOCALAPPDATA%\Programs\Oynx`, so no administrator rights are needed; it adds a Start menu shortcut (and a desktop shortcut if you tick the box). Uninstall it from **Settings > Apps** in Windows; your Oynx settings and Spotify sign-in are kept.
+
+Oynx updates itself through the same installer. With **Automatic** updates on (Settings > Updates), new versions download in the background and install when you quit Oynx; **Restart now** installs straight away. The installer is not code-signed, so SmartScreen warns about an unknown publisher the first time: choose **More info**, then **Run anyway**.
+
+Copies of Oynx 0.1.2 and earlier were standalone exes and can't install the setup program themselves; download and run the installer once to switch over.
+
 ## Run locally
 
 ```powershell
@@ -16,7 +24,7 @@ cargo run --release
 
 ## System tray
 
-Closing the window hides Oynx to the system tray instead of quitting, so playback continues. While hidden, Oynx stops rendering and releases its album-art textures. Left-click the tray icon to show the window again, or right-click it for Play/Pause, Next, Previous, and **Quit Oynx**.
+By default, closing the window hides Oynx to the system tray instead of quitting, so playback continues; choose **Quit Oynx** under **When closing** in Settings to exit instead. While hidden, Oynx stops rendering and releases its album-art textures. Left-click the tray icon to show the window again, or right-click it for Play/Pause, Next, Previous, and **Quit Oynx**.
 
 ## Equaliser and waveform
 
@@ -73,7 +81,14 @@ On Windows, the Settings page writes the JSON configuration under `%APPDATA%\Oyn
 
 ## Building on CI
 
-`.github/workflows/windows-pr.yml` runs on every pull request. It builds the release executable, asserts the binary is linked against the Windows GUI subsystem (so no console window appears), then launches it and confirms a top-level `Oynx` window is actually created before uploading the exe as an artifact.
+`.github/workflows/windows-pr.yml` runs on every pull request. It builds the release executable, asserts the binary is linked against the Windows GUI subsystem (so no console window appears), then launches it and confirms a top-level `Oynx` window is actually created. It then packages the exe into the installer with `scripts/build-installer.ps1` (Inno Setup, script in `installer/oynx.iss`), installs and uninstalls it silently with `scripts/test-installer.ps1`, and uploads the exe and installer as artifacts.
+
+`.github/workflows/release.yml` runs the same checks when a `v*` tag is pushed and attaches the installer, with its SHA-256 in the release notes, to the GitHub release. To build the installer locally, install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then run:
+
+```powershell
+cargo build --release
+.\scripts\build-installer.ps1 -Exe target\release\oynx.exe
+```
 
 ## License
 
