@@ -43,6 +43,7 @@ OutputBaseFilename=oynx-{#AppVersion}-windows-x86_64-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\icon\oynx.ico
 UninstallDisplayIcon={app}\oynx.exe
 UninstallDisplayName=Oynx
 ; Close a running Oynx before replacing its files, and leave starting it again

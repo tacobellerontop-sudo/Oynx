@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="48 48 160 160">
+  <!-- The bare Oynx mark for any background; it draws in `currentColor`. -->
+  <path fill="currentColor" fill-rule="evenodd" d="M196.45 90.61A78 78 0 1 1 165.39 59.55A22 22 0 1 0 196.45 90.61ZM128 82A46 46 0 1 0 128 174A46 46 0 1 0 128 82Z"/>
+  <circle cx="184" cy="72" r="13" fill="currentColor"/>
+</svg>

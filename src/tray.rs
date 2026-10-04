@@ -88,8 +88,8 @@ impl Tray {
             }));
         }
 
-        let size = 32;
-        let icon = Icon::from_rgba(app_icon_rgba(size), size, size)
+        let icon = app_icon(false);
+        let icon = Icon::from_rgba(icon.rgba, icon.size, icon.size)
             .map_err(|error| error.to_string())?;
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -126,29 +126,24 @@ impl Tray {
     }
 }
 
-/// The Oynx mark (a green disc with a dark ring) as `size`×`size` RGBA pixels.
-pub fn app_icon_rgba(size: u32) -> Vec<u8> {
-    let center = size as f32 / 2.0;
-    let outer = center - 0.5;
-    let ring_radius = outer * 0.4;
-    let ring_half_width = outer * 0.11;
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 + 0.5 - center;
-            let dy = y as f32 + 0.5 - center;
-            let distance = (dx * dx + dy * dy).sqrt();
-            // Anti-aliased coverage of the disc and of the ring cut into it.
-            let disc = (outer - distance + 0.5).clamp(0.0, 1.0);
-            let ring = (ring_half_width - (distance - ring_radius).abs() + 0.5).clamp(0.0, 1.0);
-            let mix = |accent: f32, dark: f32| (accent * (1.0 - ring) + dark * ring).round() as u8;
-            rgba.extend_from_slice(&[
-                mix(30.0, 9.0),
-                mix(215.0, 10.0),
-                mix(96.0, 12.0),
-                (disc * 255.0).round() as u8,
-            ]);
-        }
+/// A rendered size of the Oynx icon; see `scripts/render-icons.py`.
+pub struct AppIcon {
+    pub rgba: Vec<u8>,
+    pub size: u32,
+}
+
+/// The Oynx icon at 32×32 for the tray, or 256×256 for the window.
+pub fn app_icon(large: bool) -> AppIcon {
+    let png: &[u8] = if large {
+        include_bytes!("../assets/icon/oynx-256.png")
+    } else {
+        include_bytes!("../assets/icon/oynx-32.png")
+    };
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .expect("the bundled icon PNG is valid")
+        .into_rgba8();
+    AppIcon {
+        size: image.width(),
+        rgba: image.into_raw(),
     }
-    rgba
 }
