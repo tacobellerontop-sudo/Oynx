@@ -3,7 +3,7 @@
 ; Built by scripts/build-installer.ps1, which passes the version, the exe to
 ; package, and the output name:
 ;
-;   iscc /DAppVersion=0.1.3 /DSourceExe=C:\path\to\oynx.exe installer\oynx.iss
+;   iscc /DAppVersion=1.0.0 /DSourceExe=C:\path\to\oynx.exe installer\oynx.iss
 ;
 ; Oynx installs per user under %LOCALAPPDATA%\Programs\Oynx, so neither
 ; installing nor the in-app updater needs administrator rights. Settings,
@@ -43,6 +43,7 @@ OutputBaseFilename=oynx-{#AppVersion}-windows-x86_64-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\icon\oynx.ico
 UninstallDisplayIcon={app}\oynx.exe
 UninstallDisplayName=Oynx
 ; Close a running Oynx before replacing its files, and leave starting it again

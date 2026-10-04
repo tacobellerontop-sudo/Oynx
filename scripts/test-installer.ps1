@@ -9,7 +9,7 @@
   starts the app when it should not. Exits non-zero on any failure.
 
 .EXAMPLE
-  .\scripts\test-installer.ps1 -Setup dist\oynx-0.1.3-windows-x86_64-setup.exe
+  .\scripts\test-installer.ps1 -Setup dist\oynx-1.0.0-windows-x86_64-setup.exe
 #>
 param(
     [Parameter(Mandatory = $true)]

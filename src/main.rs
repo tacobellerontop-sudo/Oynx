@@ -5474,15 +5474,16 @@ impl eframe::App for OynxApp {
 
 fn main() -> eframe::Result {
     env_logger::init();
+    let icon = tray::app_icon(true);
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 900.0])
             .with_min_inner_size([760.0, 540.0])
             .with_decorations(false)
             .with_icon(egui::IconData {
-                rgba: tray::app_icon_rgba(64),
-                width: 64,
-                height: 64,
+                rgba: icon.rgba,
+                width: icon.size,
+                height: icon.size,
             }),
         persist_window: true,
         ..Default::default()
