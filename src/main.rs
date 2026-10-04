@@ -115,6 +115,8 @@ struct UiPrefs {
     queue_width: f32,
     player_height: f32,
     update_mode: UpdateMode,
+    /// Whether closing the window hides Oynx in the system tray instead of quitting.
+    close_to_tray: bool,
 }
 
 impl Default for UiPrefs {
@@ -124,6 +126,7 @@ impl Default for UiPrefs {
             queue_width: QUEUE_PANEL_WIDTH,
             player_height: PLAYER_HEIGHT,
             update_mode: UpdateMode::default(),
+            close_to_tray: true,
         }
     }
 }
@@ -3111,6 +3114,37 @@ impl OynxApp {
         }
 
         ui.add_space(16.0);
+        let tray_available = self.tray.is_some();
+        Self::settings_card(ui, "When closing", |ui| {
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for (close_to_tray, title, detail) in [
+                (
+                    true,
+                    "Keep running in the system tray",
+                    "Closing the window hides Oynx in the tray so music keeps playing. Quit from the tray icon.",
+                ),
+                (
+                    false,
+                    "Quit Oynx",
+                    "Closing the window stops playback and exits.",
+                ),
+            ] {
+                if option_row(ui, title, detail, self.prefs.close_to_tray == close_to_tray).clicked() {
+                    self.prefs.close_to_tray = close_to_tray;
+                }
+            }
+            if !tray_available {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("The system tray isn't available, so closing the window quits Oynx.")
+                        .size(12.0)
+                        .color(SUBTLE),
+                );
+            }
+        });
+
+        ui.add_space(16.0);
         Self::settings_card(ui, "Local data", |ui| {
             ui.label(
                 egui::RichText::new(
@@ -4462,6 +4496,7 @@ impl OynxApp {
     fn draw_root(&mut self, ui: &mut egui::Ui) {
         if ui.input(|input| input.viewport().close_requested())
             && !self.quitting
+            && self.prefs.close_to_tray
             && self.tray.is_some()
         {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -5472,6 +5507,16 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_ui_prefs_keep_closing_to_tray() {
+        let prefs: UiPrefs = serde_json::from_str(
+            r#"{"sidebar_width":240.0,"queue_width":340.0,"player_height":180.0,"update_mode":"Manual"}"#,
+        )
+        .expect("prefs saved by an older version should deserialize");
+        assert!(prefs.close_to_tray);
+        assert_eq!(prefs.sidebar_width, 240.0);
+    }
 
     #[test]
     fn saved_session_round_trips_resume_state() {
