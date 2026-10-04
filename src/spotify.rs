@@ -577,6 +577,9 @@ impl WebApiClient {
             let response = match request
                 .query(&params)
                 .bearer_auth(access_token.clone())
+                // Spotify rejects bodyless PUT/DELETE requests with 411 Length Required.
+                .header(reqwest::header::CONTENT_LENGTH, "0")
+                .body(Vec::<u8>::new())
                 .send()
                 .await
             {
