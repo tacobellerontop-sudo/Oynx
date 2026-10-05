@@ -5,6 +5,7 @@
 
 mod audio;
 mod spotify;
+mod theme;
 mod tray;
 mod updater;
 
@@ -20,6 +21,7 @@ use crate::spotify::{
     SpotifyPlaylist, SpotifyTrack,
 };
 use crate::audio::{AudioTaps, EQ_FREQUENCIES_HZ, EqualizerPreset, EqualizerSettings, MAX_EQ_GAIN_DB, MIN_EQ_GAIN_DB, NUM_BANDS, NUM_EQ_BANDS};
+use crate::theme::{ColorRole, ThemeMode, ThemeSettings, pal};
 use crate::tray::TrayAction;
 use crate::updater::{CURRENT_VERSION, UpdateMode, UpdateStatus, Updater};
 
@@ -27,23 +29,9 @@ const INTER_FONT: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
 const FAMILY_MEDIUM: &str = "Inter Medium";
 const FAMILY_BOLD: &str = "Inter Bold";
 const FAMILY_LIGHT: &str = "Inter Light";
+const CUSTOM_FONT: &str = "Custom";
 
-const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(10, 10, 11);
-const SURFACE: egui::Color32 = egui::Color32::from_rgb(16, 16, 17);
-const SURFACE_RAISED: egui::Color32 = egui::Color32::from_rgb(25, 25, 27);
-const SURFACE_HOVER: egui::Color32 = egui::Color32::from_rgb(36, 36, 39);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(32, 32, 35);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(236, 236, 236);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(140, 140, 144);
-const SUBTLE: egui::Color32 = egui::Color32::from_rgb(92, 92, 96);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(236, 236, 236);
-const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(255, 255, 255);
-const ACCENT_DARK: egui::Color32 = egui::Color32::from_rgb(40, 40, 43);
 const VINYL: egui::Color32 = egui::Color32::from_rgb(13, 13, 14);
-const PLACEHOLDER_ART: egui::Color32 = egui::Color32::from_rgb(40, 40, 43);
-const LIKED_TILE: egui::Color32 = egui::Color32::from_rgb(38, 38, 41);
-const WARNING: egui::Color32 = egui::Color32::from_rgb(214, 186, 140);
-const DANGER: egui::Color32 = egui::Color32::from_rgb(224, 132, 132);
 
 const RADIUS_XS: u8 = 4;
 const RADIUS_SM: u8 = 6;
@@ -161,7 +149,14 @@ impl Layout {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     General,
+    Themes,
     Updates,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeFile {
+    BackgroundImage,
+    Font,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -383,7 +378,29 @@ struct OynxApp {
     pending_artwork: HashSet<String>,
     artwork_retry_after: HashMap<String, Instant>,
     artwork_queue: VecDeque<(String, u32, u32, Vec<u8>)>,
-    styled: bool,
+    theme: ThemeSettings,
+    /// The theme changed since it was last written to disk.
+    theme_dirty: bool,
+    /// The theme and dark/light choice the current palette and style were built from.
+    applied_theme: Option<(ThemeSettings, bool)>,
+    /// The font file the current font definitions were built from.
+    applied_font: Option<Option<std::path::PathBuf>>,
+    theme_message: Option<String>,
+    /// An open file picker for the theme and where its answer arrives.
+    theme_dialog: Option<(ThemeFile, std::sync::mpsc::Receiver<Option<std::path::PathBuf>>)>,
+    background_texture: Option<egui::TextureHandle>,
+    /// The image path and blur the background texture was made from.
+    background_key: Option<(std::path::PathBuf, u32)>,
+    background_load: Option<((std::path::PathBuf, u32), std::sync::mpsc::Receiver<Result<egui::ColorImage, String>>)>,
+    /// Whether this window was created with a transparent surface; that can
+    /// only be chosen at launch.
+    transparent_window: bool,
+    /// A see-through window was asked for but could not be opened on this PC.
+    transparency_failed: bool,
+    /// The window blur last applied to the native window.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    blur_applied: Option<bool>,
+    system_fonts: Vec<(&'static str, std::path::PathBuf)>,
     tray: Option<tray::Tray>,
     prefs: UiPrefs,
     settings_tab: SettingsTab,
@@ -688,7 +705,19 @@ impl OynxApp {
             pending_artwork: HashSet::new(),
             artwork_retry_after: HashMap::new(),
             artwork_queue: VecDeque::new(),
-            styled: false,
+            theme: ThemeSettings::load(&theme_path()),
+            theme_dirty: false,
+            applied_theme: None,
+            applied_font: None,
+            theme_message: None,
+            theme_dialog: None,
+            background_texture: None,
+            background_key: None,
+            background_load: None,
+            transparent_window: false,
+            transparency_failed: false,
+            blur_applied: None,
+            system_fonts: theme::installed_system_fonts(),
             tray: None,
             prefs: UiPrefs::default(),
             settings_tab: SettingsTab::General,
@@ -1549,7 +1578,40 @@ impl OynxApp {
             || track.album.to_lowercase().contains(query)
     }
 
-    fn apply_style(ctx: &egui::Context) {
+    /// Rebuilds the fonts, palette and egui style whenever the theme or the
+    /// Windows light/dark mode changed since they were last applied.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        if self.applied_font.as_ref() != Some(&self.theme.font) {
+            let custom = self.theme.font.as_deref().and_then(|path| match theme::load_font(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    self.theme_message = Some(error);
+                    None
+                }
+            });
+            if custom.is_none() && self.theme.font.is_some() {
+                self.theme.font = None;
+                self.theme_dirty = true;
+            }
+            Self::apply_fonts(ctx, custom);
+            self.applied_font = Some(self.theme.font.clone());
+        }
+        let dark = self.theme.is_dark(ctx.system_theme());
+        if self
+            .applied_theme
+            .as_ref()
+            .is_none_or(|(applied, applied_dark)| *applied != self.theme || *applied_dark != dark)
+        {
+            let palette = self.theme.palette(dark);
+            theme::set_palette(palette);
+            Self::apply_visuals(ctx, &palette);
+            self.applied_theme = Some((self.theme.clone(), dark));
+        }
+    }
+
+    /// Registers Inter in its weights, with a custom font (when chosen) in
+    /// front of it so Inter still covers any characters the custom font lacks.
+    fn apply_fonts(ctx: &egui::Context, custom: Option<Vec<u8>>) {
         let mut fonts = egui::FontDefinitions::default();
         let inter = |weight: f32| {
             std::sync::Arc::new(egui::FontData::from_static(INTER_FONT).tweak(
@@ -1582,47 +1644,59 @@ impl OynxApp {
                 .families
                 .insert(egui::FontFamily::Name(name.into()), family);
         }
+        if let Some(bytes) = custom {
+            fonts
+                .font_data
+                .insert(CUSTOM_FONT.to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            for (family, names) in fonts.families.iter_mut() {
+                if *family != egui::FontFamily::Monospace {
+                    names.insert(0, CUSTOM_FONT.to_owned());
+                }
+            }
+        }
         ctx.set_fonts(fonts);
+    }
 
+    fn apply_visuals(ctx: &egui::Context, palette: &theme::Palette) {
         let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
-        let mut visuals = egui::Visuals::dark();
+        let mut visuals = if palette.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
 
-        visuals.override_text_color = Some(TEXT);
-        visuals.weak_text_color = Some(MUTED);
-        visuals.panel_fill = BACKGROUND;
-        visuals.window_fill = SURFACE_RAISED;
-        visuals.window_stroke = egui::Stroke::new(1.0, BORDER);
+        visuals.override_text_color = Some(pal().text);
+        visuals.weak_text_color = Some(pal().muted);
+        visuals.panel_fill = pal().background;
+        visuals.window_fill = pal().surface_raised;
+        visuals.window_stroke = egui::Stroke::new(1.0, pal().border);
         visuals.window_corner_radius = egui::CornerRadius::same(RADIUS_MD);
         visuals.menu_corner_radius = egui::CornerRadius::same(RADIUS_MD);
-        visuals.extreme_bg_color = SURFACE_RAISED;
-        visuals.faint_bg_color = SURFACE;
-        visuals.text_edit_bg_color = Some(SURFACE_RAISED);
-        visuals.hyperlink_color = ACCENT;
-        visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
-        visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+        visuals.extreme_bg_color = pal().surface_raised;
+        visuals.faint_bg_color = pal().surface;
+        visuals.text_edit_bg_color = Some(pal().surface_raised);
+        visuals.hyperlink_color = pal().accent;
+        visuals.selection.bg_fill = pal().accent.gamma_multiply(0.35);
+        visuals.selection.stroke = egui::Stroke::new(1.0, pal().accent);
         visuals.slider_trailing_fill = true;
 
         let radius = egui::CornerRadius::same(RADIUS_SM);
         visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
         visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::TRANSPARENT;
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, pal().border);
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, pal().text);
         visuals.widgets.noninteractive.corner_radius = radius;
-        visuals.widgets.inactive.bg_fill = SURFACE_RAISED;
-        visuals.widgets.inactive.weak_bg_fill = SURFACE_RAISED;
-        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
+        visuals.widgets.inactive.bg_fill = pal().surface_raised;
+        visuals.widgets.inactive.weak_bg_fill = pal().surface_raised;
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, pal().border);
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, pal().text);
         visuals.widgets.inactive.corner_radius = radius;
-        visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
-        visuals.widgets.hovered.weak_bg_fill = SURFACE_HOVER;
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, SUBTLE);
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT);
+        visuals.widgets.hovered.bg_fill = pal().surface_hover;
+        visuals.widgets.hovered.weak_bg_fill = pal().surface_hover;
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, pal().subtle);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, pal().text);
         visuals.widgets.hovered.corner_radius = radius;
         visuals.widgets.hovered.expansion = 0.0;
-        visuals.widgets.active.bg_fill = SURFACE_HOVER;
-        visuals.widgets.active.weak_bg_fill = SURFACE_HOVER;
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, TEXT);
+        visuals.widgets.active.bg_fill = pal().surface_hover;
+        visuals.widgets.active.weak_bg_fill = pal().surface_hover;
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, pal().accent);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, pal().text);
         visuals.widgets.active.corner_radius = radius;
         visuals.widgets.active.expansion = 0.0;
         visuals.widgets.open = visuals.widgets.hovered;
@@ -1661,18 +1735,18 @@ impl OynxApp {
         let size = rect.width().min(rect.height());
         // A slightly different grey per placeholder keeps rows of them readable.
         let tone = [0.0, 0.04, 0.08, 0.02][(artwork.pattern % 4) as usize];
-        painter.rect_filled(rect, radius, PLACEHOLDER_ART.lerp_to_gamma(TEXT, tone));
-        paint_icon(painter, Icon::Note, rect.center(), size * 0.32, TEXT.gamma_multiply(0.16));
+        painter.rect_filled(rect, radius, pal().placeholder_art.lerp_to_gamma(pal().text, tone));
+        paint_icon(painter, Icon::Note, rect.center(), size * 0.32, pal().text.gamma_multiply(0.16));
     }
 
     fn paint_liked_tile(painter: &egui::Painter, rect: egui::Rect, radius: egui::CornerRadius) {
-        painter.rect_filled(rect, radius, LIKED_TILE);
+        painter.rect_filled(rect, radius, pal().liked_tile);
         paint_icon(
             painter,
             Icon::HeartFilled,
             rect.center(),
             rect.width() * 0.42,
-            egui::Color32::WHITE,
+            pal().text,
         );
     }
 
@@ -1730,13 +1804,13 @@ impl OynxApp {
                 return;
             }
         }
-        ui.painter().circle_filled(center, radius, ACCENT_DARK);
+        ui.painter().circle_filled(center, radius, pal().accent_dark);
         ui.painter().text(
             center,
             egui::Align2::CENTER_CENTER,
             self.account_initial(),
             font_bold(radius * 0.8),
-            ACCENT,
+            pal().accent,
         );
     }
 
@@ -1793,18 +1867,18 @@ impl OynxApp {
     // ----------------------------------------------------------------------
 
     fn page_title(ui: &mut egui::Ui, title: &str) {
-        ui.label(egui::RichText::new(title).font(font_light(32.0)).color(TEXT));
+        ui.label(egui::RichText::new(title).font(font_light(32.0)).color(pal().text));
         ui.add_space(18.0);
     }
 
     fn section_heading(ui: &mut egui::Ui, title: &str) {
-        ui.label(egui::RichText::new(title).font(font_bold(21.0)).color(TEXT));
+        ui.label(egui::RichText::new(title).font(font_bold(21.0)).color(pal().text));
         ui.add_space(12.0);
     }
 
     fn muted_note(ui: &mut egui::Ui, text: &str) {
         ui.add_space(4.0);
-        ui.label(egui::RichText::new(text).size(14.0).color(MUTED));
+        ui.label(egui::RichText::new(text).size(14.0).color(pal().muted));
         ui.add_space(4.0);
     }
 
@@ -1847,7 +1921,7 @@ impl OynxApp {
         );
         if hover > 0.0 {
             ui.painter()
-                .rect_filled(rect, RADIUS_MD, SURFACE_RAISED.gamma_multiply(hover));
+                .rect_filled(rect, RADIUS_MD, pal().surface_raised.gamma_multiply(hover));
         }
         let art = egui::Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(art_size, art_size));
         self.paint_artwork(ui, art, artwork, image_url, egui::CornerRadius::same(RADIUS_SM));
@@ -1860,13 +1934,13 @@ impl OynxApp {
                 egui::Color32::from_black_alpha(90).gamma_multiply(hover),
             );
             ui.painter()
-                .circle_filled(center, 22.0, ACCENT.gamma_multiply(hover));
+                .circle_filled(center, 22.0, pal().accent.gamma_multiply(hover));
             paint_icon(
                 ui.painter(),
                 Icon::Play,
                 center + egui::vec2(1.0, 0.0),
                 16.0,
-                BACKGROUND.gamma_multiply(hover),
+                pal().on_accent.gamma_multiply(hover),
             );
         }
         paint_text(
@@ -1875,7 +1949,7 @@ impl OynxApp {
             egui::Align2::LEFT_TOP,
             title,
             font_bold(14.0),
-            TEXT,
+            pal().text,
             art_size,
         );
         paint_text(
@@ -1884,7 +1958,7 @@ impl OynxApp {
             egui::Align2::LEFT_TOP,
             subtitle,
             egui::FontId::proportional(12.0),
-            MUTED,
+            pal().muted,
             art_size,
         );
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1961,7 +2035,7 @@ impl OynxApp {
     fn draw_track_table_header(ui: &mut egui::Ui, columns: TrackColumns) {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(columns.width, 34.0), egui::Sense::hover());
         let painter = ui.painter();
-        let color = SUBTLE;
+        let color = pal().subtle;
         let font = font_medium(12.0);
         let y = rect.center().y;
         painter.text(egui::pos2(rect.left() + 24.0, y), egui::Align2::CENTER_CENTER, "#", font.clone(), color);
@@ -1976,7 +2050,7 @@ impl OynxApp {
             );
         }
         paint_icon(painter, Icon::Clock, egui::pos2(rect.right() - 32.0, y), 14.0, color);
-        painter.hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, BORDER));
+        painter.hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, pal().border));
         ui.add_space(8.0);
     }
 
@@ -2017,14 +2091,14 @@ impl OynxApp {
         let current_t = animate(ui, response.id.with("current"), current, ANIM_MEDIUM);
         if hover > 0.0 {
             ui.painter()
-                .rect_filled(rect, RADIUS_SM, SURFACE_RAISED.gamma_multiply(hover));
+                .rect_filled(rect, RADIUS_SM, pal().surface_raised.gamma_multiply(hover));
         }
         let y = rect.center().y;
 
         // Cross-fade the index/equalizer with the hover play icon.
         let index_center = egui::pos2(rect.left() + 24.0, y);
         if hover > 0.0 {
-            paint_icon(ui.painter(), Icon::Play, index_center, 13.0, TEXT.gamma_multiply(hover));
+            paint_icon(ui.painter(), Icon::Play, index_center, 13.0, pal().text.gamma_multiply(hover));
         }
         if hover < 1.0 {
             let rest = 1.0 - hover;
@@ -2037,7 +2111,7 @@ impl OynxApp {
                     ui.painter(),
                     index_center,
                     14.0,
-                    ACCENT.gamma_multiply(rest * current_t),
+                    pal().accent.gamma_multiply(rest * current_t),
                     time,
                 );
             }
@@ -2047,7 +2121,7 @@ impl OynxApp {
                     egui::Align2::CENTER_CENTER,
                     (index + 1).to_string(),
                     egui::FontId::proportional(14.0),
-                    MUTED.gamma_multiply(rest * (1.0 - current_t)),
+                    pal().muted.gamma_multiply(rest * (1.0 - current_t)),
                 );
             }
         }
@@ -2073,7 +2147,7 @@ impl OynxApp {
             egui::Align2::LEFT_BOTTOM,
             &track.title,
             font_medium(14.0),
-            mix(TEXT, ACCENT, current_t),
+            mix(pal().text, pal().accent, current_t),
             title_right - text_x,
         );
         paint_text(
@@ -2082,7 +2156,7 @@ impl OynxApp {
             egui::Align2::LEFT_TOP,
             &track.artist,
             egui::FontId::proportional(12.0),
-            mix(MUTED, TEXT, hover),
+            mix(pal().muted, pal().text, hover),
             title_right - text_x,
         );
         if columns.album > 0.0 {
@@ -2092,7 +2166,7 @@ impl OynxApp {
                 egui::Align2::LEFT_CENTER,
                 &track.album,
                 egui::FontId::proportional(13.0),
-                MUTED,
+                pal().muted,
                 columns.album - 16.0,
             );
         }
@@ -2101,7 +2175,7 @@ impl OynxApp {
             egui::Align2::RIGHT_CENTER,
             &track.duration,
             egui::FontId::proportional(13.0),
-            MUTED,
+            pal().muted,
         );
 
         let mut like_clicked = false;
@@ -2115,9 +2189,9 @@ impl OynxApp {
             );
             let like_response = ui.interact(like_rect, like_id, egui::Sense::click());
             let color = if liked {
-                ACCENT
+                pal().accent
             } else {
-                mix(MUTED, TEXT, hover_t(ui, &like_response))
+                mix(pal().muted, pal().text, hover_t(ui, &like_response))
             };
             paint_icon(
                 ui.painter(),
@@ -2144,7 +2218,7 @@ impl OynxApp {
                 Icon::Heart,
                 egui::pos2(rect.right() - 80.0, y),
                 16.0,
-                MUTED.gamma_multiply(hover),
+                pal().muted.gamma_multiply(hover),
             );
         }
 
@@ -2161,7 +2235,7 @@ impl OynxApp {
         let hover = hover_t(ui, &response);
         if hover > 0.0 {
             ui.painter()
-                .rect_filled(rect, RADIUS_SM, SURFACE_RAISED.gamma_multiply(hover));
+                .rect_filled(rect, RADIUS_SM, pal().surface_raised.gamma_multiply(hover));
         }
         let art = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(40.0, 40.0));
         self.paint_artwork(
@@ -2177,7 +2251,7 @@ impl OynxApp {
             egui::Align2::RIGHT_CENTER,
             &track.duration,
             egui::FontId::proportional(12.0),
-            SUBTLE,
+            pal().subtle,
         );
         let text_x = art.right() + 12.0;
         let max_width = duration.left() - text_x - 10.0;
@@ -2187,7 +2261,7 @@ impl OynxApp {
             egui::Align2::LEFT_BOTTOM,
             &track.title,
             font_medium(13.0),
-            if current { ACCENT } else { TEXT },
+            if current { pal().accent } else { pal().text },
             max_width,
         );
         paint_text(
@@ -2196,7 +2270,7 @@ impl OynxApp {
             egui::Align2::LEFT_TOP,
             &track.artist,
             egui::FontId::proportional(12.0),
-            MUTED,
+            pal().muted,
             max_width,
         );
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2231,7 +2305,7 @@ impl OynxApp {
             egui::Align2::LEFT_BOTTOM,
             kind,
             font_medium(13.0),
-            TEXT,
+            pal().text,
         );
         paint_text(
             painter,
@@ -2239,7 +2313,7 @@ impl OynxApp {
             egui::Align2::LEFT_BOTTOM,
             title,
             font_light(title_size),
-            TEXT,
+            pal().text,
             max_width,
         );
         paint_text(
@@ -2248,7 +2322,7 @@ impl OynxApp {
             egui::Align2::LEFT_BOTTOM,
             subtitle,
             egui::FontId::proportional(13.0),
-            MUTED,
+            pal().muted,
             max_width,
         );
         ui.add_space(20.0);
@@ -2326,7 +2400,7 @@ impl OynxApp {
         if let Some(error) = self.liked_songs_error.clone() {
             let mut retry = false;
             egui::Frame::new()
-                .fill(SURFACE_RAISED)
+                .fill(pal().surface_raised)
                 .corner_radius(RADIUS_MD)
                 .inner_margin(egui::Margin::symmetric(16, 12))
                 .show(ui, |ui| {
@@ -2336,9 +2410,9 @@ impl OynxApp {
                             ui.label(
                                 egui::RichText::new("Liked Songs could not be loaded")
                                     .font(font_medium(13.0))
-                                    .color(WARNING),
+                                    .color(pal().warning),
                             );
-                            ui.label(egui::RichText::new(&error).size(12.0).color(MUTED));
+                            ui.label(egui::RichText::new(&error).size(12.0).color(pal().muted));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             retry = pill_button(ui, "Retry", ButtonKind::Secondary).clicked();
@@ -2374,7 +2448,7 @@ impl OynxApp {
         }
         let ready = self.connection_state == ConnectionState::Ready;
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Your Library").font(font_light(32.0)).color(TEXT));
+            ui.label(egui::RichText::new("Your Library").font(font_light(32.0)).color(pal().text));
             if ready {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if pill_button(ui, "Refresh", ButtonKind::Ghost).clicked() {
@@ -2392,7 +2466,7 @@ impl OynxApp {
         ui.painter().rect_filled(
             rect,
             RADIUS_LG,
-            if response.hovered() { SURFACE_HOVER } else { SURFACE_RAISED },
+            if response.hovered() { pal().surface_hover } else { pal().surface_raised },
         );
         let art = egui::Rect::from_min_size(rect.min + egui::vec2(16.0, 16.0), egui::vec2(64.0, 64.0));
         Self::paint_liked_tile(ui.painter(), art, egui::CornerRadius::same(RADIUS_SM));
@@ -2401,7 +2475,7 @@ impl OynxApp {
             egui::Align2::LEFT_BOTTOM,
             "Liked Songs",
             font_bold(18.0),
-            TEXT,
+            pal().text,
         );
         let liked_count = self.liked_songs.len();
         ui.painter().text(
@@ -2413,14 +2487,14 @@ impl OynxApp {
                 "Everything you save, in one place".to_owned()
             },
             egui::FontId::proportional(13.0),
-            MUTED,
+            pal().muted,
         );
         paint_icon(
             ui.painter(),
             Icon::ChevronRight,
             rect.right_center() - egui::vec2(28.0, 0.0),
             16.0,
-            if response.hovered() { TEXT } else { MUTED },
+            if response.hovered() { pal().text } else { pal().muted },
         );
         if response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2486,8 +2560,8 @@ impl OynxApp {
         ui.painter().rect(
             rect,
             23,
-            if focused || hovered { SURFACE_HOVER } else { SURFACE_RAISED },
-            egui::Stroke::new(1.0, if focused { SUBTLE } else { egui::Color32::TRANSPARENT }),
+            if focused || hovered { pal().surface_hover } else { pal().surface_raised },
+            egui::Stroke::new(1.0, if focused { pal().subtle } else { egui::Color32::TRANSPARENT }),
             egui::StrokeKind::Inside,
         );
         paint_icon(
@@ -2495,7 +2569,7 @@ impl OynxApp {
             Icon::Search,
             rect.left_center() + egui::vec2(22.0, 0.0),
             16.0,
-            if focused { TEXT } else { MUTED },
+            if focused { pal().text } else { pal().muted },
         );
         let has_query = !self.search.is_empty();
         let edit_rect = egui::Rect::from_min_max(
@@ -2539,7 +2613,7 @@ impl OynxApp {
         let query = self.search.trim().to_lowercase();
         if query.is_empty() {
             egui::Frame::new()
-                .fill(SURFACE_RAISED)
+                .fill(pal().surface_raised)
                 .corner_radius(RADIUS_LG)
                 .inner_margin(egui::Margin::same(24))
                 .show(ui, |ui| {
@@ -2547,7 +2621,7 @@ impl OynxApp {
                     ui.label(
                         egui::RichText::new("Find your next repeat")
                             .font(font_bold(22.0))
-                            .color(TEXT),
+                            .color(pal().text),
                     );
                     ui.add_space(4.0);
                     ui.label(
@@ -2555,7 +2629,7 @@ impl OynxApp {
                             "Search your library by track, artist, or album. Press Enter to search all of Spotify.",
                         )
                         .size(13.0)
-                        .color(MUTED),
+                        .color(pal().muted),
                     );
                     ui.add_space(16.0);
                     ui.horizontal_wrapped(|ui| {
@@ -2580,12 +2654,12 @@ impl OynxApp {
                 ui.label(
                     egui::RichText::new(format!("Results for “{}”", self.search.trim()))
                         .font(font_bold(18.0))
-                        .color(TEXT),
+                        .color(pal().text),
                 );
                 ui.label(
                     egui::RichText::new("Matching tracks from your current selection")
                         .size(12.0)
-                        .color(MUTED),
+                        .color(pal().muted),
                 );
             });
             if self.connection_state == ConnectionState::Ready {
@@ -2656,16 +2730,16 @@ impl OynxApp {
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Queue").font(font_light(32.0)).color(TEXT));
+            ui.label(egui::RichText::new("Queue").font(font_light(32.0)).color(pal().text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(format!("{queue_len} tracks"))
                         .size(13.0)
-                        .color(MUTED),
+                        .color(pal().muted),
                 );
             });
         });
-        ui.label(egui::RichText::new(format!("Playing from {source}")).size(12.0).color(MUTED));
+        ui.label(egui::RichText::new(format!("Playing from {source}")).size(12.0).color(pal().muted));
         ui.add_space(16.0);
         if queue_len == 0 {
             Self::muted_note(ui, "Your playback queue is empty.");
@@ -2697,21 +2771,21 @@ impl OynxApp {
             };
             let mut dismiss = false;
             egui::Frame::new()
-                .fill(SURFACE_RAISED)
+                .fill(pal().surface_raised)
                 .corner_radius(RADIUS_MD)
                 .inner_margin(egui::Margin::symmetric(16, 10))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 4.0, WARNING);
+                        ui.painter().circle_filled(dot.center(), 4.0, pal().warning);
                         ui.vertical(|ui| {
                             ui.set_max_width(ui.available_width() - 110.0);
                             ui.label(
                                 egui::RichText::new("Spotify data issue")
                                     .font(font_medium(13.0))
-                                    .color(TEXT),
+                                    .color(pal().text),
                             );
-                            ui.label(egui::RichText::new(error).size(12.0).color(MUTED));
+                            ui.label(egui::RichText::new(error).size(12.0).color(pal().muted));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             dismiss = pill_button(ui, "Dismiss", ButtonKind::Ghost).clicked();
@@ -2747,22 +2821,22 @@ impl OynxApp {
         };
 
         egui::Frame::new()
-            .fill(SURFACE_RAISED)
+            .fill(pal().surface_raised)
             .corner_radius(RADIUS_LG)
             .inner_margin(egui::Margin::symmetric(18, 16))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 22.0, ACCENT_DARK);
-                    paint_icon(ui.painter(), Icon::Note, rect.center(), 20.0, ACCENT);
+                    ui.painter().circle_filled(rect.center(), 22.0, pal().accent_dark);
+                    paint_icon(ui.painter(), Icon::Note, rect.center(), 20.0, pal().accent);
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
                         ui.set_max_width(ui.available_width() - 200.0);
-                        ui.label(egui::RichText::new(title).font(font_bold(15.0)).color(TEXT));
+                        ui.label(egui::RichText::new(title).font(font_bold(15.0)).color(pal().text));
                         ui.label(
                             egui::RichText::new(error.as_deref().unwrap_or(detail))
                                 .size(12.0)
-                                .color(if error.is_some() { DANGER } else { MUTED }),
+                                .color(if error.is_some() { pal().danger } else { pal().muted }),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2789,7 +2863,7 @@ impl OynxApp {
     }
 
     fn settings_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
-        ui.label(egui::RichText::new(label).font(font_medium(12.0)).color(MUTED));
+        ui.label(egui::RichText::new(label).font(font_medium(12.0)).color(pal().muted));
         ui.add_space(2.0);
         ui.add(
             egui::TextEdit::singleline(value)
@@ -2803,13 +2877,13 @@ impl OynxApp {
 
     fn settings_card(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
         egui::Frame::new()
-            .fill(SURFACE_RAISED.gamma_multiply(0.7))
-            .stroke(egui::Stroke::new(1.0, BORDER))
+            .fill(pal().surface_raised.gamma_multiply(0.7))
+            .stroke(egui::Stroke::new(1.0, pal().border))
             .corner_radius(RADIUS_LG)
             .inner_margin(egui::Margin::same(24))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width().min(680.0));
-                ui.label(egui::RichText::new(title).font(font_bold(18.0)).color(TEXT));
+                ui.label(egui::RichText::new(title).font(font_bold(18.0)).color(pal().text));
                 ui.add_space(6.0);
                 add_contents(ui);
             });
@@ -2819,7 +2893,11 @@ impl OynxApp {
         Self::page_title(ui, "Settings");
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            for (tab, label) in [(SettingsTab::General, "General"), (SettingsTab::Updates, "Updates")] {
+            for (tab, label) in [
+                (SettingsTab::General, "General"),
+                (SettingsTab::Themes, "Themes"),
+                (SettingsTab::Updates, "Updates"),
+            ] {
                 if chip(ui, label, self.settings_tab == tab).clicked() {
                     self.settings_tab = tab;
                 }
@@ -2828,6 +2906,7 @@ impl OynxApp {
         ui.add_space(20.0);
         match self.settings_tab {
             SettingsTab::General => self.draw_general_settings(ui),
+            SettingsTab::Themes => self.draw_theme_settings(ui),
             SettingsTab::Updates => self.draw_update_settings(ui),
         }
     }
@@ -2842,7 +2921,7 @@ impl OynxApp {
             ui.label(
                 egui::RichText::new(format!("Oynx {CURRENT_VERSION}"))
                     .font(font_medium(15.0))
-                    .color(TEXT),
+                    .color(pal().text),
             );
             let checked = self.updater.last_checked().map(|at| {
                 let minutes = at.elapsed().as_secs() / 60;
@@ -2856,39 +2935,39 @@ impl OynxApp {
             let (line, color) = match &status {
                 UpdateStatus::Idle => (
                     checked.map_or("Not checked yet".to_owned(), |when| format!("Last checked {when}")),
-                    MUTED,
+                    pal().muted,
                 ),
-                UpdateStatus::Checking => ("Checking for updates…".to_owned(), MUTED),
+                UpdateStatus::Checking => ("Checking for updates…".to_owned(), pal().muted),
                 UpdateStatus::UpToDate => (
                     format!("You're up to date · checked {}", checked.unwrap_or_else(|| "just now".to_owned())),
-                    MUTED,
+                    pal().muted,
                 ),
-                UpdateStatus::Available(release) => (format!("Version {} is available", release.version), TEXT),
+                UpdateStatus::Available(release) => (format!("Version {} is available", release.version), pal().text),
                 UpdateStatus::Downloading { release, downloaded, total } => (
                     format!(
                         "Downloading {}… {:.0}%",
                         release.version,
                         *downloaded as f32 / (*total).max(1) as f32 * 100.0
                     ),
-                    TEXT,
+                    pal().text,
                 ),
                 UpdateStatus::Ready(release) => (
                     format!(
                         "Version {} is downloaded and installs when you quit Oynx, or restart now to update straight away.",
                         release.version
                     ),
-                    TEXT,
+                    pal().text,
                 ),
-                UpdateStatus::Failed(error) => (error.clone(), DANGER),
+                UpdateStatus::Failed(error) => (error.clone(), pal().danger),
             };
             ui.label(egui::RichText::new(line).size(12.5).color(color));
             if let UpdateStatus::Downloading { downloaded, total, .. } = &status {
                 ui.add_space(8.0);
                 let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(360.0), 3.0), egui::Sense::hover());
-                ui.painter().rect_filled(bar, 2, TEXT.gamma_multiply(0.15));
+                ui.painter().rect_filled(bar, 2, pal().text.gamma_multiply(0.15));
                 let mut filled = bar;
                 filled.set_right(bar.left() + bar.width() * (*downloaded as f32 / (*total).max(1) as f32).min(1.0));
-                ui.painter().rect_filled(filled, 2, TEXT);
+                ui.painter().rect_filled(filled, 2, pal().text);
             }
             ui.add_space(14.0);
             ui.horizontal(|ui| match &status {
@@ -2919,7 +2998,7 @@ impl OynxApp {
             });
             if let Some(reason) = &blocker {
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new(reason).size(12.0).color(SUBTLE));
+                ui.label(egui::RichText::new(reason).size(12.0).color(pal().subtle));
             }
         });
         if restart {
@@ -2962,6 +3041,399 @@ impl OynxApp {
         }
     }
 
+    fn save_theme(&mut self) {
+        if !self.theme_dirty {
+            return;
+        }
+        match self.theme.save(&theme_path()) {
+            Ok(()) => self.theme_dirty = false,
+            Err(error) => log::warn!("{error}"),
+        }
+    }
+
+    /// Paints the window background: the theme colour, the background image
+    /// over it, both faded by the window opacity when the window is see-through.
+    fn paint_background(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let opacity = if self.transparent_window { self.theme.window_opacity } else { 1.0 };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0, pal().background.gamma_multiply(opacity));
+        if let Some(texture) = &self.background_texture {
+            // Cover the window, cropping whichever side of the image overflows.
+            let size = texture.size_vec2();
+            let scale = (rect.width() / size.x).max(rect.height() / size.y);
+            let visible = rect.size() / (size * scale);
+            let uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), visible);
+            painter.image(
+                texture.id(),
+                rect,
+                uv,
+                egui::Color32::WHITE.gamma_multiply(self.theme.image_strength * opacity),
+            );
+        }
+    }
+
+    /// Loads the chosen background image off the UI thread, one load at a
+    /// time, so dragging the blur slider never stalls a frame.
+    fn update_background_image(&mut self, ctx: &egui::Context) {
+        if let Some((key, receiver)) = &self.background_load {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    let key = key.clone();
+                    self.background_load = None;
+                    match result {
+                        Ok(image) => {
+                            self.background_texture =
+                                Some(ctx.load_texture("theme-background", image, egui::TextureOptions::LINEAR));
+                            self.background_key = Some(key);
+                        }
+                        Err(error) => {
+                            self.theme_message = Some(error);
+                            self.theme.background_image = None;
+                            self.theme_dirty = true;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.background_load = None,
+            }
+        }
+        let wanted = self
+            .theme
+            .background_image
+            .clone()
+            .map(|path| (path, self.theme.image_blur.round() as u32));
+        if wanted == self.background_key {
+            return;
+        }
+        let Some(key) = wanted else {
+            self.background_texture = None;
+            self.background_key = None;
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (path, blur) = key.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(theme::load_background_image(&path, blur as f32));
+            ctx.request_repaint();
+        });
+        self.background_load = Some((key, receiver));
+    }
+
+    /// Turns the native acrylic blur behind the window on or off to match the theme.
+    #[cfg(windows)]
+    fn apply_window_blur(&mut self, frame: &eframe::Frame) {
+        if !self.transparent_window {
+            return;
+        }
+        let blur = self.theme.window_blur;
+        if self.blur_applied == Some(blur) {
+            return;
+        }
+        self.blur_applied = Some(blur);
+        let result = if blur {
+            window_vibrancy::apply_acrylic(frame, None).or_else(|_| window_vibrancy::apply_blur(frame, None))
+        } else {
+            let _ = window_vibrancy::clear_blur(frame);
+            window_vibrancy::clear_acrylic(frame)
+        };
+        if let Err(error) = result {
+            log::warn!("Could not change the window blur: {error}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn apply_window_blur(&mut self, _frame: &eframe::Frame) {}
+
+    fn open_theme_file_dialog(&mut self, ctx: &egui::Context, kind: ThemeFile) {
+        if self.theme_dialog.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let dialog = match kind {
+                ThemeFile::BackgroundImage => rfd::FileDialog::new()
+                    .set_title("Choose a background image")
+                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"]),
+                ThemeFile::Font => rfd::FileDialog::new()
+                    .set_title("Choose a font")
+                    .add_filter("Fonts", &["ttf", "otf", "ttc"]),
+            };
+            let _ = sender.send(dialog.pick_file());
+            ctx.request_repaint();
+        });
+        self.theme_dialog = Some((kind, receiver));
+    }
+
+    fn poll_theme_dialog(&mut self) {
+        let Some((kind, receiver)) = &self.theme_dialog else {
+            return;
+        };
+        let picked = match receiver.try_recv() {
+            Ok(picked) => picked,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        let kind = *kind;
+        self.theme_dialog = None;
+        let Some(path) = picked else {
+            return;
+        };
+        match kind {
+            ThemeFile::BackgroundImage => {
+                self.theme.background_image = Some(path);
+                self.theme_message = None;
+            }
+            ThemeFile::Font => match theme::load_font(&path) {
+                Ok(_) => {
+                    self.theme.font = Some(path);
+                    self.theme_message = None;
+                }
+                Err(error) => self.theme_message = Some(error),
+            },
+        }
+        self.theme_dirty = true;
+    }
+
+    /// Starts a fresh copy of Oynx and closes this one, for settings that can
+    /// only take effect when the window is created.
+    fn restart_app(&mut self, ctx: &egui::Context) {
+        self.save_theme();
+        self.save_session();
+        match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn()) {
+            Ok(_) => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => self.theme_message = Some(format!("Could not restart Oynx: {error}")),
+        }
+    }
+
+    fn draw_theme_settings(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let before = self.theme.clone();
+        let dark = self.theme.is_dark(ctx.system_theme());
+
+        Self::settings_card(ui, "Mode", |ui| {
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for (mode, title, detail) in [
+                (ThemeMode::Dark, "Dark", "Light text on a dark background."),
+                (ThemeMode::Light, "Light", "Dark text on a light background."),
+                (ThemeMode::System, "Match Windows", "Follows the app mode in Windows settings."),
+            ] {
+                if option_row(ui, title, detail, self.theme.mode == mode).clicked() {
+                    self.theme.mode = mode;
+                }
+            }
+        });
+
+        ui.add_space(16.0);
+        let palette = self.theme.palette(dark);
+        let card_title = if dark { "Colours for dark mode" } else { "Colours for light mode" };
+        Self::settings_card(ui, card_title, |ui| {
+            ui.label(
+                egui::RichText::new("Dark and light mode each keep their own colours. Start from a preset or pick any colour yourself.")
+                    .size(13.0)
+                    .color(pal().muted),
+            );
+            ui.add_space(14.0);
+            let presets = if dark { theme::DARK_PRESETS } else { theme::LIGHT_PRESETS };
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                let colors = self.theme.colors_mut(dark);
+                if chip(ui, "Oynx", colors.is_empty()).clicked() {
+                    *colors = theme::ColorOverrides::default();
+                }
+                for preset in presets {
+                    if chip(ui, preset.name, *colors == preset.colors).clicked() {
+                        *colors = preset.colors;
+                    }
+                }
+            });
+            ui.add_space(14.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for role in ColorRole::ALL {
+                let current = match role {
+                    ColorRole::Text => palette.text,
+                    ColorRole::SecondaryText => palette.muted,
+                    ColorRole::Background => palette.background,
+                    ColorRole::Panels => palette.surface_raised,
+                    ColorRole::Accent => palette.accent,
+                    ColorRole::Visualizer => palette.visualizer,
+                };
+                let colors = self.theme.colors_mut(dark);
+                let custom = colors.get(role).is_some();
+                theme_row(ui, role.label(), role.detail(), |ui| {
+                    let mut rgb = [current.r(), current.g(), current.b()];
+                    ui.spacing_mut().interact_size = egui::vec2(44.0, 26.0);
+                    let swatch = egui::color_picker::color_edit_button_srgb(ui, &mut rgb);
+                    if swatch.changed() {
+                        colors.set(role, Some(rgb));
+                    }
+                    // Repaint the swatch rounded and outlined so dark colours
+                    // stay visible against the card.
+                    let painter = ui.painter();
+                    painter.rect_filled(swatch.rect, RADIUS_SM, current);
+                    painter.rect_stroke(
+                        swatch.rect,
+                        RADIUS_SM,
+                        egui::Stroke::new(1.0, mix(pal().subtle, pal().text, hover_t(ui, &swatch))),
+                        egui::StrokeKind::Inside,
+                    );
+                    if custom
+                        && text_link(ui, "Reset")
+                            .on_hover_text("Use the preset colour")
+                            .clicked()
+                    {
+                        colors.set(role, None);
+                    }
+                });
+            }
+        });
+
+        ui.add_space(16.0);
+        let picking = self.theme_dialog.is_some();
+        Self::settings_card(ui, "Background image", |ui| {
+            let detail = self
+                .theme
+                .background_image
+                .as_deref()
+                .map_or_else(|| "None chosen".to_owned(), theme::file_name);
+            let mut choose = false;
+            let mut remove = false;
+            theme_row(ui, "Image", &detail, |ui| {
+                if self.theme.background_image.is_some() {
+                    remove = pill_button(ui, "Remove", ButtonKind::Ghost).clicked();
+                }
+                choose = pill_button(ui, "Choose image…", ButtonKind::Secondary).clicked();
+            });
+            if choose && !picking {
+                self.open_theme_file_dialog(&ctx, ThemeFile::BackgroundImage);
+            }
+            if remove {
+                self.theme.background_image = None;
+            }
+            if self.theme.background_image.is_some() {
+                ui.add_space(10.0);
+                theme_slider(ui, "Visibility", &mut self.theme.image_strength, 0.05..=1.0, |value| {
+                    format!("{:.0}%", value * 100.0)
+                });
+                ui.add_space(8.0);
+                theme_slider(ui, "Blur", &mut self.theme.image_blur, 0.0..=theme::MAX_IMAGE_BLUR, |value| {
+                    if value < 0.5 { "Off".to_owned() } else { format!("{value:.0} px") }
+                });
+                if self.background_load.is_some() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Loading image…").size(12.0).color(pal().subtle));
+                }
+            }
+        });
+
+        ui.add_space(16.0);
+        Self::settings_card(ui, "Font", |ui| {
+            ui.label(
+                egui::RichText::new("Used for all text in Oynx. Pick a font that comes with Windows or any TrueType or OpenType file.")
+                    .size(13.0)
+                    .color(pal().muted),
+            );
+            ui.add_space(14.0);
+            let mut choose = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                if chip(ui, "Inter", self.theme.font.is_none()).clicked() {
+                    self.theme.font = None;
+                }
+                let mut matched = self.theme.font.is_none();
+                for (name, path) in &self.system_fonts {
+                    let selected = self.theme.font.as_ref() == Some(path);
+                    matched |= selected;
+                    if chip(ui, name, selected).clicked() {
+                        self.theme.font = Some(path.clone());
+                    }
+                }
+                if !matched && let Some(path) = &self.theme.font {
+                    chip(ui, &theme::file_name(path), true);
+                }
+                choose = chip(ui, "Choose a font file…", false).clicked();
+            });
+            if choose && !picking {
+                self.open_theme_file_dialog(&ctx, ThemeFile::Font);
+            }
+        });
+
+        ui.add_space(16.0);
+        let mut restart = false;
+        Self::settings_card(ui, "Window", |ui| {
+            ui.add_space(4.0);
+            theme_slider(
+                ui,
+                "Opacity",
+                &mut self.theme.window_opacity,
+                theme::MIN_WINDOW_OPACITY..=1.0,
+                |value| format!("{:.0}%", value * 100.0),
+            );
+            ui.add_space(12.0);
+            let mut blur = self.theme.window_blur;
+            theme_row(
+                ui,
+                "Blur behind the window",
+                "Frosts whatever is behind Oynx when the window is see-through.",
+                |ui| {
+                    if toggle_switch(ui, blur).clicked() {
+                        blur = !blur;
+                    }
+                },
+            );
+            self.theme.window_blur = blur;
+            if !cfg!(windows) && blur {
+                ui.label(egui::RichText::new("Window blur is only available on Windows.").size(12.0).color(pal().subtle));
+            }
+            if self.theme.wants_transparent_window() && self.transparency_failed {
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(
+                        "This PC's graphics driver couldn't open a see-through window, so Oynx is using a normal one.",
+                    )
+                    .size(12.0)
+                    .color(pal().warning),
+                );
+            } else if self.theme.wants_transparent_window() && !self.transparent_window {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Restart Oynx to make the window see-through.")
+                            .size(12.0)
+                            .color(pal().warning),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        restart = pill_button(ui, "Restart now", ButtonKind::Primary).clicked();
+                    });
+                });
+            }
+        });
+        if restart {
+            self.restart_app(&ctx);
+        }
+
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            if pill_button(ui, "Restore the default theme", ButtonKind::Secondary).clicked() {
+                self.theme = ThemeSettings::default();
+                self.theme_message = None;
+            }
+        });
+        if let Some(message) = &self.theme_message {
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new(message).size(12.0).color(pal().danger));
+        }
+
+        if self.theme != before {
+            self.theme_dirty = true;
+        }
+    }
+
     fn draw_general_settings(&mut self, ui: &mut egui::Ui) {
         let connected = self.connection_state == ConnectionState::Ready;
         let mut account_action = false;
@@ -2976,7 +3448,7 @@ impl OynxApp {
                     ui.label(
                         egui::RichText::new(self.account_label())
                             .font(font_medium(15.0))
-                            .color(TEXT),
+                            .color(pal().text),
                     );
                     ui.label(
                         egui::RichText::new(match self.connection_state {
@@ -2987,7 +3459,7 @@ impl OynxApp {
                             ConnectionState::Disconnected => "Not connected",
                         })
                         .size(12.0)
-                        .color(MUTED),
+                        .color(pal().muted),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3022,7 +3494,7 @@ impl OynxApp {
                     "Oynx uses PKCE and never needs a client secret. Configure a separate Web API app to avoid Spotify's shared rate-limit bucket; Oynx will open one browser authorization for playback and another for the Web API.",
                 )
                 .size(13.0)
-                .color(MUTED),
+                .color(pal().muted),
             );
             ui.add_space(20.0);
             Self::settings_field(
@@ -3048,7 +3520,7 @@ impl OynxApp {
                     "Spotify rate limits are per app, so a separate Web API app avoids the shared Librespot limit.",
                 )
                 .size(12.0)
-                .color(SUBTLE),
+                .color(pal().subtle),
             );
             if self.spotify_web_api_client_id.trim().is_empty() {
                 ui.label(
@@ -3056,7 +3528,7 @@ impl OynxApp {
                         "No separate Web API app is configured; playlist requests share the streaming app's rate limit.",
                     )
                     .size(12.0)
-                    .color(WARNING),
+                    .color(pal().warning),
                 );
             }
             ui.add_space(14.0);
@@ -3073,7 +3545,7 @@ impl OynxApp {
             });
             if let Some(message) = &self.settings_message {
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new(message).size(12.0).color(ACCENT));
+                ui.label(egui::RichText::new(message).size(12.0).color(pal().accent));
             }
         });
 
@@ -3143,7 +3615,7 @@ impl OynxApp {
                 ui.label(
                     egui::RichText::new("The system tray isn't available, so closing the window quits Oynx.")
                         .size(12.0)
-                        .color(SUBTLE),
+                        .color(pal().subtle),
                 );
             }
         });
@@ -3155,19 +3627,19 @@ impl OynxApp {
                     "Credentials and audio cache are managed by Librespot in the local Oynx data directory.",
                 )
                 .size(13.0)
-                .color(MUTED),
+                .color(pal().muted),
             );
             ui.add_space(14.0);
             for (label, path) in [
                 ("Config", SpotifyConfig::path()),
                 ("Cache", SpotifyConfig::cache_path()),
             ] {
-                ui.label(egui::RichText::new(label).font(font_medium(12.0)).color(MUTED));
+                ui.label(egui::RichText::new(label).font(font_medium(12.0)).color(pal().muted));
                 ui.label(
                     egui::RichText::new(path.display().to_string())
                         .monospace()
                         .size(12.0)
-                        .color(TEXT),
+                        .color(pal().text),
                 );
                 ui.add_space(10.0);
             }
@@ -3176,7 +3648,7 @@ impl OynxApp {
                     "OAuth scopes: streaming, playlists, recommendations, and library read/write",
                 )
                 .size(12.0)
-                .color(SUBTLE),
+                .color(pal().subtle),
             );
         });
     }
@@ -3258,7 +3730,7 @@ impl OynxApp {
             egui::Stroke::new(1.0, egui::Color32::from_white_alpha(46)),
         );
         if texture_id.is_some() {
-            painter.circle_filled(center, radius * 0.035, BACKGROUND);
+            painter.circle_filled(center, radius * 0.035, pal().background);
         }
     }
 
@@ -3283,7 +3755,7 @@ impl OynxApp {
             egui::Align2::LEFT_CENTER,
             "oynx",
             font_light(21.0),
-            TEXT,
+            pal().text,
             7.0,
         );
 
@@ -3321,13 +3793,13 @@ impl OynxApp {
             let hover_fill = if icon == Icon::Close {
                 egui::Color32::from_rgb(170, 44, 38)
             } else {
-                SURFACE_HOVER
+                pal().surface_hover
             };
             if hover > 0.0 {
                 ui.painter()
                     .rect_filled(button, RADIUS_SM, hover_fill.gamma_multiply(hover));
             }
-            paint_icon(ui.painter(), icon, center, 15.0, mix(MUTED, TEXT, hover));
+            paint_icon(ui.painter(), icon, center, 15.0, mix(pal().muted, pal().text, hover));
             if response.clicked() {
                 ctx.send_viewport_cmd(match icon {
                     Icon::Close => egui::ViewportCommand::Close,
@@ -3434,7 +3906,7 @@ impl OynxApp {
         let fill = select.max(hover * 0.5);
         if fill > 0.0 {
             ui.painter()
-                .rect_filled(rect, RADIUS_MD, SURFACE_RAISED.gamma_multiply(fill));
+                .rect_filled(rect, RADIUS_MD, pal().surface_raised.gamma_multiply(fill));
         }
         let icon = match item {
             Section::Home => Icon::Home,
@@ -3444,7 +3916,7 @@ impl OynxApp {
             Section::Queue => Icon::Queue,
             Section::Settings => Icon::Settings,
         };
-        let color = mix(TEXT.gamma_multiply(0.72), TEXT, select.max(hover));
+        let color = mix(pal().text.gamma_multiply(0.72), pal().text, select.max(hover));
         paint_icon(
             ui.painter(),
             icon,
@@ -3480,7 +3952,7 @@ impl OynxApp {
         ui.painter().vline(
             rect.right() - 0.5,
             rect.top()..=divider_bottom,
-            egui::Stroke::new(1.0, BORDER),
+            egui::Stroke::new(1.0, pal().border),
         );
 
         let mut nav = ui.new_child(
@@ -3547,7 +4019,7 @@ impl OynxApp {
             egui::Align2::LEFT_TOP,
             "NOW PLAYING",
             egui::FontId::proportional(10.5),
-            SUBTLE,
+            pal().subtle,
             2.6,
         );
         let show_visualizer = rect.width() >= 520.0;
@@ -3595,7 +4067,7 @@ impl OynxApp {
                 egui::Align2::LEFT_TOP,
                 &track.title,
                 font_light(30.0),
-                TEXT,
+                pal().text,
                 rect.width(),
             );
             let artist = paint_text(
@@ -3604,7 +4076,7 @@ impl OynxApp {
                 egui::Align2::LEFT_TOP,
                 &track.artist,
                 font_light(21.0),
-                MUTED,
+                pal().muted,
                 rect.width(),
             );
             painter.text(
@@ -3612,7 +4084,7 @@ impl OynxApp {
                 egui::Align2::LEFT_TOP,
                 message,
                 egui::FontId::proportional(13.0),
-                SUBTLE,
+                pal().subtle,
             );
             if self.lyrics_error.is_some() {
                 let retry = egui::Rect::from_min_size(
@@ -3640,7 +4112,7 @@ impl OynxApp {
                 .show(&mut lyrics_ui, |ui| {
                     for line in &self.lyrics {
                         let text = if line.text.is_empty() { " " } else { line.text.as_str() };
-                        ui.label(egui::RichText::new(text).font(font_light(21.0)).color(MUTED));
+                        ui.label(egui::RichText::new(text).font(font_light(21.0)).color(pal().muted));
                         ui.add_space(10.0);
                     }
                 });
@@ -3686,12 +4158,12 @@ impl OynxApp {
                     let active = index == current;
                     let emphasis = animate(ui, lyrics_id.with(index), active, ANIM_SLOW);
                     let rest = if index < current {
-                        TEXT.gamma_multiply(0.26)
+                        pal().text.gamma_multiply(0.26)
                     } else {
-                        TEXT.gamma_multiply(0.4)
+                        pal().text.gamma_multiply(0.4)
                     };
                     let text = if line.text.is_empty() { "♪" } else { line.text.as_str() };
-                    let color = mix(rest, TEXT, emphasis);
+                    let color = mix(rest, pal().text, emphasis);
                     // Reserve the height the line needs at its largest size, so a
                     // line growing or shrinking never shifts the ones around it.
                     let reserved = ui
@@ -3790,7 +4262,7 @@ impl OynxApp {
             painter.hline(
                 rect.left()..=rect.left() + length,
                 y,
-                egui::Stroke::new(1.2, TEXT.gamma_multiply(0.18 + 0.72 * level)),
+                egui::Stroke::new(1.2, pal().visualizer.gamma_multiply(0.18 + 0.72 * level)),
             );
         }
     }
@@ -3804,7 +4276,7 @@ impl OynxApp {
         ui.painter().vline(
             rect.left() + 0.5,
             rect.top()..=rect.bottom() - 16.0,
-            egui::Stroke::new(1.0, BORDER),
+            egui::Stroke::new(1.0, pal().border),
         );
         let mut panel = ui.new_child(
             egui::UiBuilder::new()
@@ -3825,7 +4297,7 @@ impl OynxApp {
                 RightPanelTab::Recent => "Recently played",
             },
             egui::FontId::proportional(17.0),
-            TEXT,
+            pal().text,
         );
         let dots = egui::Rect::from_center_size(header.right_center() - egui::vec2(18.0, 0.0), egui::vec2(34.0, 34.0));
         let dots_response = icon_button_at(ui, ui.id().with("queue_menu"), dots, Icon::Dots, 18.0, false)
@@ -3913,14 +4385,14 @@ impl OynxApp {
         let fill = if current { 1.0 } else { hover * 0.6 };
         if fill > 0.0 {
             ui.painter()
-                .rect_filled(rect, RADIUS_MD, SURFACE_RAISED.gamma_multiply(fill));
+                .rect_filled(rect, RADIUS_MD, pal().surface_raised.gamma_multiply(fill));
         }
         let y = rect.center().y;
         if current {
             ui.painter().rect_filled(
                 egui::Rect::from_center_size(egui::pos2(rect.left() + 1.0, y), egui::vec2(2.0, 28.0)),
                 1,
-                TEXT.gamma_multiply(0.7),
+                pal().text.gamma_multiply(0.7),
             );
         }
         let art = egui::Rect::from_min_size(egui::pos2(rect.left() + 12.0, y - 24.0), egui::vec2(48.0, 48.0));
@@ -3938,7 +4410,7 @@ impl OynxApp {
                 RADIUS_XS,
                 egui::Color32::from_black_alpha((120.0 * t) as u8),
             );
-            paint_icon(ui.painter(), Icon::Play, art.center() + egui::vec2(1.0, 0.0), 14.0, TEXT.gamma_multiply(t));
+            paint_icon(ui.painter(), Icon::Play, art.center() + egui::vec2(1.0, 0.0), 14.0, pal().text.gamma_multiply(t));
         }
         let painter = ui.painter();
         let duration = painter.text(
@@ -3946,7 +4418,7 @@ impl OynxApp {
             egui::Align2::RIGHT_CENTER,
             &track.duration,
             egui::FontId::proportional(12.5),
-            MUTED,
+            pal().muted,
         );
         let text_x = art.right() + 20.0;
         let max_width = duration.left() - text_x - 10.0;
@@ -3956,7 +4428,7 @@ impl OynxApp {
             egui::Align2::LEFT_BOTTOM,
             &track.title,
             egui::FontId::proportional(14.0),
-            TEXT,
+            pal().text,
             max_width,
         );
         paint_text(
@@ -3965,7 +4437,7 @@ impl OynxApp {
             egui::Align2::LEFT_TOP,
             &track.artist,
             egui::FontId::proportional(12.5),
-            MUTED,
+            pal().muted,
             max_width,
         );
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -4022,7 +4494,7 @@ impl OynxApp {
             egui::Align2::LEFT_CENTER,
             &track.title,
             egui::FontId::proportional(16.0),
-            TEXT.gamma_multiply(enter),
+            pal().text.gamma_multiply(enter),
             text_width,
         );
         let artist = paint_text(
@@ -4031,7 +4503,7 @@ impl OynxApp {
             egui::Align2::LEFT_CENTER,
             &track.artist,
             egui::FontId::proportional(13.0),
-            MUTED.gamma_multiply(enter),
+            pal().muted.gamma_multiply(enter),
             text_width,
         );
         let heart_x = title.right().max(artist.right()) + 56.0;
@@ -4101,27 +4573,27 @@ impl OynxApp {
         ui.data_mut(|data| data.insert_temp(state_id, (target, last_jump)));
         let glide = if now - last_jump < 0.3 { 0.25 } else { 0.0 };
         let progress = ui.ctx().animate_value_with_time(id.with("progress"), target, glide);
-        let rail = egui::Stroke::new(1.5, TEXT.gamma_multiply(0.2));
+        let rail = egui::Stroke::new(1.5, pal().text.gamma_multiply(0.2));
         ui.painter().hline(bar_left..=bar_right, bar_y, rail);
         let knob_x = bar_left + (bar_right - bar_left) * progress;
         ui.painter()
-            .hline(bar_left..=knob_x, bar_y, egui::Stroke::new(1.5, TEXT));
+            .hline(bar_left..=knob_x, bar_y, egui::Stroke::new(1.5, pal().accent));
         ui.painter()
-            .circle_filled(egui::pos2(knob_x, bar_y), 4.5 + 1.5 * bar_hover, TEXT);
+            .circle_filled(egui::pos2(knob_x, bar_y), 4.5 + 1.5 * bar_hover, pal().accent);
         let time_font = egui::FontId::proportional(12.0);
         ui.painter().text(
             egui::pos2(bar_left, bar_y + 15.0),
             egui::Align2::LEFT_CENTER,
             format_duration(self.position_ms.min(track.duration_ms())),
             time_font.clone(),
-            MUTED,
+            pal().muted,
         );
         ui.painter().text(
             egui::pos2(bar_right, bar_y + 15.0),
             egui::Align2::RIGHT_CENTER,
             &track.duration,
             time_font,
-            MUTED,
+            pal().muted,
         );
 
         // Transport
@@ -4158,13 +4630,13 @@ impl OynxApp {
             ui.painter().circle_filled(
                 play_rect.center(),
                 play_radius,
-                SURFACE_RAISED.gamma_multiply(play_hover),
+                pal().surface_raised.gamma_multiply(play_hover),
             );
         }
         ui.painter().circle_stroke(
             play_rect.center(),
             play_radius,
-            egui::Stroke::new(1.3, TEXT.gamma_multiply(0.9)),
+            egui::Stroke::new(1.3, pal().accent.gamma_multiply(0.9)),
         );
         // Morph between play and pause: one icon shrinks away as the other grows in.
         let pausing = animate(ui, id.with("pausing"), self.playing, ANIM_MEDIUM);
@@ -4174,7 +4646,7 @@ impl OynxApp {
                 Icon::Play,
                 play_rect.center() + egui::vec2(2.0, 0.0),
                 18.0 * (1.0 - 0.4 * pausing),
-                TEXT.gamma_multiply(1.0 - pausing),
+                pal().text.gamma_multiply(1.0 - pausing),
             );
         }
         if pausing > 0.0 {
@@ -4183,7 +4655,7 @@ impl OynxApp {
                 Icon::Pause,
                 play_rect.center(),
                 18.0 * (0.6 + 0.4 * pausing),
-                TEXT.gamma_multiply(pausing),
+                pal().text.gamma_multiply(pausing),
             );
         }
         if play
@@ -4222,7 +4694,7 @@ impl OynxApp {
             egui::Align2::LEFT_CENTER,
             "Equaliser",
             egui::FontId::proportional(17.0),
-            TEXT,
+            pal().text,
         );
         let switch = egui::Rect::from_center_size(header.right_center() - egui::vec2(22.0, 0.0), egui::vec2(44.0, 24.0));
         let switch_response = ui
@@ -4232,11 +4704,11 @@ impl OynxApp {
         if switch_response.clicked() {
             settings.enabled = !settings.enabled;
         }
-        ui.painter().rect_filled(switch, 12, mix(SURFACE_HOVER, TEXT, enabled_t));
+        ui.painter().rect_filled(switch, 12, mix(pal().surface_hover, pal().text, enabled_t));
         ui.painter().circle_filled(
             egui::pos2(switch.left() + 12.0 + 20.0 * enabled_t, switch.center().y),
             8.5,
-            mix(MUTED, BACKGROUND, enabled_t),
+            mix(pal().muted, pal().background, enabled_t),
         );
         ui.add_space(14.0);
 
@@ -4273,14 +4745,14 @@ impl OynxApp {
             painter.hline(
                 plot.x_range(),
                 y,
-                egui::Stroke::new(1.0, if db == 0.0 { BORDER.gamma_multiply(1.6) } else { BORDER }),
+                egui::Stroke::new(1.0, if db == 0.0 { pal().border.gamma_multiply(1.6) } else { pal().border }),
             );
             painter.text(
                 egui::pos2(graph.left(), y),
                 egui::Align2::LEFT_CENTER,
                 if db == 0.0 { "0".to_owned() } else { format!("{db:+}") },
                 egui::FontId::proportional(10.5),
-                SUBTLE,
+                pal().subtle,
             );
         }
         // The bands are one octave apart, so frequency is linear in x.
@@ -4297,7 +4769,7 @@ impl OynxApp {
         let zero = y_for(0.0);
         let mut fill = egui::Mesh::default();
         for (index, point) in curve.iter().enumerate() {
-            let color = TEXT.gamma_multiply(0.07 * dim);
+            let color = pal().text.gamma_multiply(0.07 * dim);
             fill.colored_vertex(*point, color);
             fill.colored_vertex(egui::pos2(point.x, zero), color);
             if index > 0 {
@@ -4307,7 +4779,7 @@ impl OynxApp {
             }
         }
         painter.add(fill);
-        painter.add(egui::Shape::line(curve, egui::Stroke::new(1.8, TEXT.gamma_multiply(0.85 * dim))));
+        painter.add(egui::Shape::line(curve, egui::Stroke::new(1.8, pal().text.gamma_multiply(0.85 * dim))));
 
         for band in 0..NUM_EQ_BANDS {
             let x = x_for_band(band);
@@ -4332,16 +4804,16 @@ impl OynxApp {
             let knob = egui::pos2(x, y_for(gain));
             let focus = animate(ui, response.id.with("focus"), response.hovered() || response.dragged(), ANIM_FAST);
             let painter = ui.painter();
-            painter.vline(x, plot.y_range(), egui::Stroke::new(1.0, TEXT.gamma_multiply(0.08 + 0.1 * focus)));
-            painter.circle_filled(knob, 6.0 + 1.5 * focus, TEXT.gamma_multiply(dim));
-            painter.circle_stroke(knob, 6.0 + 1.5 * focus, egui::Stroke::new(2.0, SURFACE_RAISED));
+            painter.vline(x, plot.y_range(), egui::Stroke::new(1.0, pal().text.gamma_multiply(0.08 + 0.1 * focus)));
+            painter.circle_filled(knob, 6.0 + 1.5 * focus, pal().text.gamma_multiply(dim));
+            painter.circle_stroke(knob, 6.0 + 1.5 * focus, egui::Stroke::new(2.0, pal().surface_raised));
             if focus > 0.0 {
                 painter.text(
                     knob - egui::vec2(0.0, 16.0),
                     egui::Align2::CENTER_BOTTOM,
                     format!("{:+} dB", settings.gains_db[band]),
                     egui::FontId::proportional(11.0),
-                    TEXT.gamma_multiply(focus),
+                    pal().text.gamma_multiply(focus),
                 );
             }
             let frequency = EQ_FREQUENCIES_HZ[band];
@@ -4354,7 +4826,7 @@ impl OynxApp {
                     format!("{frequency}")
                 },
                 egui::FontId::proportional(11.0),
-                MUTED,
+                pal().muted,
             );
         }
         ui.add_space(10.0);
@@ -4372,7 +4844,7 @@ impl OynxApp {
                 } else {
                     format!("Preamp {:+.1} dB · double-click a band to reset it", settings.auto_preamp_db())
                 };
-                ui.label(egui::RichText::new(note).size(11.5).color(SUBTLE));
+                ui.label(egui::RichText::new(note).size(11.5).color(pal().subtle));
             });
         });
 
@@ -4473,13 +4945,13 @@ impl OynxApp {
         ui.painter().hline(
             slider.x_range(),
             cy,
-            egui::Stroke::new(1.5, TEXT.gamma_multiply(0.2)),
+            egui::Stroke::new(1.5, pal().text.gamma_multiply(0.2)),
         );
         let level = slider.left() + slider.width() * self.volume.clamp(0.0, 1.0);
         ui.painter()
-            .hline(slider.left()..=level, cy, egui::Stroke::new(1.5, TEXT));
+            .hline(slider.left()..=level, cy, egui::Stroke::new(1.5, pal().accent));
         ui.painter()
-            .circle_filled(egui::pos2(level, cy), 4.5 + 1.5 * active, TEXT);
+            .circle_filled(egui::pos2(level, cy), 4.5 + 1.5 * active, pal().accent);
         volume_response.on_hover_text(format!("Volume {}%", (self.volume * 100.0).round() as u32));
         let volume_icon = Icon::Volume(if self.volume <= 0.001 {
             0
@@ -4493,7 +4965,7 @@ impl OynxApp {
             volume_icon,
             egui::pos2(slider.left() - 26.0, cy),
             17.0,
-            MUTED,
+            pal().muted,
         );
     }
 
@@ -4512,19 +4984,19 @@ impl OynxApp {
         if self.window_hidden {
             return;
         }
-        if !self.styled {
-            Self::apply_style(ui.ctx());
-            self.styled = true;
-        }
+        self.poll_theme_dialog();
+        self.apply_theme(ui.ctx());
+        self.update_background_image(ui.ctx());
 
-        ui.painter()
-            .rect_filled(ui.ctx().viewport_rect(), 0, BACKGROUND);
         self.fit_window_to_monitor(ui.ctx());
         let viewport = ui.ctx().viewport_rect();
+        self.paint_background(ui, viewport);
         let layout = Layout::fit(&self.prefs, viewport.size());
         let wide_layout = layout.queue_fits;
         self.advance_disc();
-        let plain = egui::Frame::new().fill(BACKGROUND);
+        // Panels stay unfilled so the one background (colour, image and window
+        // transparency) shows through all of them.
+        let plain = egui::Frame::new();
 
         egui::Panel::top("title_bar")
             .exact_size(TITLE_BAR_HEIGHT)
@@ -4932,7 +5404,7 @@ fn splitter(
     let active = response.hovered() || response.dragged();
     let t = animate(ui, response.id.with("active"), active, ANIM_FAST);
     if t > 0.0 {
-        let stroke = egui::Stroke::new(1.0 + t, TEXT.gamma_multiply(0.35 * t));
+        let stroke = egui::Stroke::new(1.0 + t, pal().text.gamma_multiply(0.35 * t));
         if vertical {
             ui.painter().vline(zone.center().x, zone.y_range(), stroke);
         } else {
@@ -4952,8 +5424,8 @@ fn splitter(
 /// The frame shared by popup menus.
 fn menu_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(SURFACE_RAISED)
-        .stroke(egui::Stroke::new(1.0, BORDER))
+        .fill(pal().surface_raised)
+        .stroke(egui::Stroke::new(1.0, pal().border))
         .corner_radius(RADIUS_LG)
         .inner_margin(egui::Margin::same(6))
         .shadow(egui::Shadow {
@@ -5003,15 +5475,15 @@ fn pop_scale(ui: &egui::Ui, id: egui::Id, on: bool, amount: f32) -> f32 {
 
 fn pill_button(ui: &mut egui::Ui, text: &str, kind: ButtonKind) -> egui::Response {
     let font = font_medium(13.0);
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), TEXT);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), pal().text);
     let size = egui::vec2(galley.size().x + 32.0, 36.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let hover = hover_t(ui, &response);
     let press = press_t(ui, &response);
     let (fill, color) = match kind {
-        ButtonKind::Primary => (mix(ACCENT, ACCENT_HOVER, hover), BACKGROUND),
-        ButtonKind::Secondary => (mix(SURFACE_RAISED, SURFACE_HOVER, hover), TEXT),
-        ButtonKind::Ghost => (SURFACE_RAISED.gamma_multiply(hover), mix(MUTED, TEXT, hover)),
+        ButtonKind::Primary => (mix(pal().accent, pal().accent_hover, hover), pal().on_accent),
+        ButtonKind::Secondary => (mix(pal().surface_raised, pal().surface_hover, hover), pal().text),
+        ButtonKind::Ghost => (pal().surface_raised.gamma_multiply(hover), mix(pal().muted, pal().text, hover)),
     };
     let rect = rect.shrink2(rect.size() * 0.03 * press);
     ui.painter().rect_filled(rect, 18, fill);
@@ -5020,15 +5492,81 @@ fn pill_button(ui: &mut egui::Ui, text: &str, kind: ButtonKind) -> egui::Respons
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// A settings row: title and detail on the left, controls on the right.
+fn theme_row(ui: &mut egui::Ui, title: &str, detail: &str, add_controls: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(44.0);
+        ui.vertical(|ui| {
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.label(egui::RichText::new(title).font(font_medium(14.0)).color(pal().text));
+            ui.label(egui::RichText::new(detail).size(12.0).color(pal().muted));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            add_controls(ui);
+        });
+    });
+}
+
+/// A labelled slider with its value shown on the right.
+fn theme_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    format: impl Fn(f32) -> String,
+) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).font(font_medium(13.0)).color(pal().text));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(format(*value)).size(12.0).color(pal().muted));
+        });
+    });
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_width = ui.available_width();
+        ui.add(egui::Slider::new(value, range).show_value(false));
+    });
+}
+
+/// An on/off switch, the same as the equaliser's.
+fn toggle_switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(44.0, 24.0), egui::Sense::click());
+    let on_t = animate(ui, response.id.with("on"), on, ANIM_MEDIUM);
+    ui.painter().rect_filled(rect, 12, mix(pal().surface_hover, pal().text, on_t));
+    ui.painter().circle_filled(
+        egui::pos2(rect.left() + 12.0 + 20.0 * on_t, rect.center().y),
+        8.5,
+        mix(pal().muted, pal().background, on_t),
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Small underlined-on-hover text that acts as a button.
+fn text_link(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let font = font_medium(12.0);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), pal().muted);
+    let (rect, response) = ui.allocate_exact_size(galley.size() + egui::vec2(4.0, 8.0), egui::Sense::click());
+    let hover = hover_t(ui, &response);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font,
+        mix(pal().muted, pal().text, hover),
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let font = font_medium(12.0);
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), TEXT);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), pal().text);
     let size = egui::vec2(galley.size().x + 26.0, 30.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let hover = hover_t(ui, &response);
     let select = animate(ui, response.id.with("selected"), selected, ANIM_MEDIUM);
-    let fill = mix(mix(SURFACE_RAISED, SURFACE_HOVER, hover), TEXT, select);
-    let color = mix(TEXT, BACKGROUND, select);
+    let fill = mix(mix(pal().surface_raised, pal().surface_hover, hover), pal().text, select);
+    let color = mix(pal().text, pal().background, select);
     ui.painter().rect_filled(rect, 15, fill);
     ui.painter()
         .text(rect.center(), egui::Align2::CENTER_CENTER, text, font, color);
@@ -5037,15 +5575,15 @@ fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
 
 fn text_icon_button(ui: &mut egui::Ui, icon: Icon, text: &str) -> egui::Response {
     let font = font_medium(13.0);
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), TEXT);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), pal().text);
     let size = egui::vec2(galley.size().x + 44.0, 32.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let hover = hover_t(ui, &response);
     if hover > 0.0 {
         ui.painter()
-            .rect_filled(rect, 16, SURFACE_RAISED.gamma_multiply(hover));
+            .rect_filled(rect, 16, pal().surface_raised.gamma_multiply(hover));
     }
-    let color = mix(MUTED, TEXT, hover);
+    let color = mix(pal().muted, pal().text, hover);
     paint_icon(ui.painter(), icon, rect.left_center() + egui::vec2(18.0, 0.0), 14.0, color);
     ui.painter().text(
         rect.left_center() + egui::vec2(32.0, 0.0),
@@ -5063,28 +5601,28 @@ fn option_row(ui: &mut egui::Ui, title: &str, detail: &str, selected: bool) -> e
     let detail_galley = ui.painter().layout(
         detail.to_owned(),
         egui::FontId::proportional(12.0),
-        MUTED,
+        pal().muted,
         width - 64.0,
     );
     let height = 30.0 + detail_galley.size().y + 12.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let hover = hover_t(ui, &response);
     if hover > 0.0 {
-        ui.painter().rect_filled(rect, RADIUS_MD, SURFACE_HOVER.gamma_multiply(0.6 * hover));
+        ui.painter().rect_filled(rect, RADIUS_MD, pal().surface_hover.gamma_multiply(0.6 * hover));
     }
     let marker = egui::pos2(rect.left() + 22.0, rect.top() + 21.0);
-    ui.painter().circle_stroke(marker, 8.0, egui::Stroke::new(1.3, if selected { TEXT } else { MUTED }));
+    ui.painter().circle_stroke(marker, 8.0, egui::Stroke::new(1.3, if selected { pal().text } else { pal().muted }));
     if selected {
-        ui.painter().circle_filled(marker, 4.0, TEXT);
+        ui.painter().circle_filled(marker, 4.0, pal().text);
     }
     ui.painter().text(
         egui::pos2(rect.left() + 44.0, marker.y),
         egui::Align2::LEFT_CENTER,
         title,
         font_medium(14.0),
-        TEXT,
+        pal().text,
     );
-    ui.painter().galley(egui::pos2(rect.left() + 44.0, rect.top() + 33.0), detail_galley, MUTED);
+    ui.painter().galley(egui::pos2(rect.left() + 44.0, rect.top() + 33.0), detail_galley, pal().muted);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -5096,16 +5634,16 @@ fn menu_item(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool) -> egui:
     );
     let hovered = response.hovered();
     if hovered || selected {
-        ui.painter().rect_filled(rect, RADIUS_SM, SURFACE_HOVER);
+        ui.painter().rect_filled(rect, RADIUS_SM, pal().surface_hover);
     }
-    let color = if hovered || selected { TEXT } else { MUTED };
+    let color = if hovered || selected { pal().text } else { pal().muted };
     paint_icon(ui.painter(), icon, rect.left_center() + egui::vec2(20.0, 0.0), 16.0, color);
     ui.painter().text(
         rect.left_center() + egui::vec2(42.0, 0.0),
         egui::Align2::LEFT_CENTER,
         text,
         font_medium(13.0),
-        if hovered || selected { TEXT } else { MUTED },
+        if hovered || selected { pal().text } else { pal().muted },
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -5146,13 +5684,13 @@ fn play_circle_button(ui: &mut egui::Ui, size: f32) -> egui::Response {
     let hover = hover_t(ui, &response);
     let press = press_t(ui, &response);
     let radius = size * 0.5 * (0.96 + 0.04 * hover - 0.05 * press);
-    ui.painter().circle_filled(rect.center(), radius, mix(ACCENT, ACCENT_HOVER, hover));
+    ui.painter().circle_filled(rect.center(), radius, mix(pal().accent, pal().accent_hover, hover));
     paint_icon(
         ui.painter(),
         Icon::Play,
         rect.center() + egui::vec2(1.5, 0.0),
         size * 0.36,
-        BACKGROUND,
+        pal().on_accent,
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -5178,10 +5716,10 @@ fn icon_button_at(
         painter.circle_filled(
             rect.center(),
             rect.width() * 0.5 * (0.8 + 0.2 * hover),
-            SURFACE_HOVER.gamma_multiply(hover),
+            pal().surface_hover.gamma_multiply(hover),
         );
     }
-    let color = mix(mix(MUTED, ACCENT, active_t), mix(TEXT, ACCENT_HOVER, active_t), hover);
+    let color = mix(mix(pal().muted, pal().accent, active_t), mix(pal().text, pal().accent_hover, active_t), hover);
     let offset = egui::vec2(0.0, -2.0 * active_t);
     paint_icon(painter, icon, rect.center() + offset, icon_size * (1.0 - 0.08 * press), color);
     if active_t > 0.0 {
@@ -5437,6 +5975,10 @@ impl Track {
 }
 
 /// Where the equalizer curve is saved, next to the Spotify settings.
+fn theme_path() -> std::path::PathBuf {
+    SpotifyConfig::path().with_file_name("theme.json")
+}
+
 fn equalizer_path() -> std::path::PathBuf {
     SpotifyConfig::path().with_file_name("equalizer.json")
 }
@@ -5449,6 +5991,7 @@ fn format_duration(duration_ms: u32) -> String {
 impl Drop for OynxApp {
     fn drop(&mut self) {
         self.save_session();
+        self.save_theme();
         self.updater.install_on_exit();
     }
 }
@@ -5456,6 +5999,15 @@ impl Drop for OynxApp {
 impl eframe::App for OynxApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, UI_PREFS_KEY, &self.prefs);
+        self.save_theme();
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.transparent_window {
+            [0.0; 4]
+        } else {
+            pal().background.to_normalized_gamma_f32()
+        }
     }
 
     /// Popups and scroll positions should start fresh on each launch.
@@ -5467,36 +6019,42 @@ impl eframe::App for OynxApp {
         self.tick(ctx);
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.apply_window_blur(frame);
         self.draw_root(ui);
     }
 }
 
-fn main() -> eframe::Result {
-    env_logger::init();
+fn native_options(transparent: bool) -> eframe::NativeOptions {
     let icon = tray::app_icon(true);
-    let native_options = eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 900.0])
             .with_min_inner_size([760.0, 540.0])
             .with_decorations(false)
+            .with_transparent(transparent)
             .with_icon(egui::IconData {
                 rgba: icon.rgba,
                 width: icon.size,
                 height: icon.size,
             }),
         persist_window: true,
+        renderer: if transparent { eframe::Renderer::Glow } else { eframe::Renderer::default() },
         ..Default::default()
-    };
+    }
+}
 
+/// Runs Oynx in a window created with or without a transparent surface.
+fn run(transparent: bool, transparency_failed: bool) -> eframe::Result {
     eframe::run_native(
         "Oynx",
-        native_options,
-        Box::new(|cc| {
-            // Fonts registered here are available from the first frame.
-            OynxApp::apply_style(&cc.egui_ctx);
+        native_options(transparent),
+        Box::new(move |cc| {
             let mut app = OynxApp::new();
-            app.styled = true;
+            app.transparent_window = transparent;
+            app.transparency_failed = transparency_failed;
+            // Fonts registered here are available from the first frame.
+            app.apply_theme(&cc.egui_ctx);
             if let Some(prefs) = cc.storage.and_then(|storage| eframe::get_value::<UiPrefs>(storage, UI_PREFS_KEY)) {
                 app.prefs = prefs;
             }
@@ -5508,6 +6066,22 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+fn main() -> eframe::Result {
+    env_logger::init();
+    // A see-through window needs a transparent surface from the start, and the
+    // OpenGL renderer is the one that composites it on Windows. Everyone else
+    // keeps the default renderer and an opaque window.
+    let transparent = ThemeSettings::load(&theme_path()).wants_transparent_window();
+    let result = run(transparent, false);
+    if transparent && let Err(error) = &result {
+        // Without a usable OpenGL driver the see-through window can't open;
+        // never let a theme setting keep Oynx from starting.
+        log::warn!("Could not open a see-through window ({error}); opening a normal one instead");
+        return run(false, true);
+    }
+    result
 }
 
 #[cfg(test)]

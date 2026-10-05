@@ -30,6 +30,18 @@ By default, closing the window hides Oynx to the system tray instead of quitting
 
 The waveform beside the lyrics on the Now Playing screen is a live spectrum of the audio you hear, with bass in the middle and treble towards the ends. It is timed to the speakers rather than the decoder, so it stays in step with the music. The button at the bottom left opens a ten-band equaliser with presets; changes apply within a moment and are saved to `%APPDATA%Oynxqualizer.json`.
 
+## Themes
+
+**Settings > Themes** changes how Oynx looks:
+
+- **Mode**: Dark, Light, or **Match Windows** to follow the Windows app mode.
+- **Colours**: text, secondary text, background, panels, accent and visualiser. Dark and light mode keep separate colours; start from a preset or pick any colour.
+- **Background image**: any PNG, JPEG, WebP or BMP, with its visibility and blur adjustable.
+- **Font**: Inter by default, one of the fonts that ship with Windows, or any TrueType/OpenType file.
+- **Window**: background opacity and an acrylic blur of whatever is behind the window. Turning these on the first time needs a restart, because a see-through window has to be created that way; Oynx then uses its OpenGL renderer.
+
+The theme is saved to `%APPDATA%\Oynx\theme.json`. **Restore the default theme** puts everything back.
+
 ## Spotify sign-in
 
 Oynx uses Spotify's browser-based OAuth authorization-code flow with PKCE. It does not ask for or store your Spotify password.
