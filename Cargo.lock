@@ -1214,6 +1214,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.2",
+ "block2 0.6.2",
+ "libc",
  "objc2 0.6.4",
 ]
 
@@ -1282,6 +1284,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -1292,7 +1295,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "pollster",
+ "pollster 1.0.1",
  "profiling",
  "raw-window-handle",
  "ron",
@@ -2610,12 +2613,23 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "image-webp",
  "moxcms",
  "num-traits",
  "png",
  "tiff",
  "zune-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "image-webp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+dependencies = [
+ "byteorder-lite",
+ "quick-error",
 ]
 
 [[package]]
@@ -3640,10 +3654,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.13.2",
+ "block2 0.6.2",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
+ "objc2-quartz-core 0.3.2",
 ]
 
 [[package]]
@@ -4060,7 +4076,7 @@ dependencies = [
 
 [[package]]
 name = "oynx"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4071,12 +4087,15 @@ dependencies = [
  "librespot",
  "log",
  "reqwest",
+ "rfd",
  "rustfft",
  "serde",
  "serde_json",
  "sha2",
+ "skrifa",
  "tokio",
  "tray-icon",
+ "window-vibrancy",
  "winresource",
 ]
 
@@ -4311,6 +4330,12 @@ dependencies = [
  "rustix 1.1.5",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "pollster"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
 
 [[package]]
 name = "pollster"
@@ -4786,6 +4811,33 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "rfd"
+version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20dafead71c16a34e1ff357ddefc8afc11e7d51d6d2b9fbd07eaa48e3e540220"
+dependencies = [
+ "block2 0.6.2",
+ "dispatch2",
+ "js-sys",
+ "libc",
+ "log",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "percent-encoding",
+ "pollster 0.4.0",
+ "raw-window-handle",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "web-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6696,6 +6748,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
+name = "window-vibrancy"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "111e51caca442cafd9bab396628ac4d814880eaea4e63dfd76a12e9f342b5580"
+dependencies = [
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "objc2-quartz-core 0.3.2",
+ "raw-window-handle",
+ "windows-sys 0.61.2",
+ "windows-version",
+]
+
+[[package]]
 name = "windows"
 version = "0.54.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7023,6 +7091,15 @@ name = "windows-threading"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link 0.2.1",
+]
+
+[[package]]
+name = "windows-version"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4060a1da109b9d0326b7262c8e12c84df67cc0dbc9e33cf49e01ccc2eb63631"
 dependencies = [
  "windows-link 0.2.1",
 ]

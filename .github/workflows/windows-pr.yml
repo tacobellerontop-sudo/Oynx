@@ -110,6 +110,43 @@ jobs:
             }
           }
 
+      - name: Launch with a see-through, blurred theme
+        shell: pwsh
+        env:
+          RUST_LOG: info
+        run: |
+          # A transparent theme switches Oynx to the OpenGL renderer and turns on
+          # the acrylic blur, so check that path starts too.
+          $ErrorActionPreference = 'Stop'
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $themeDir = Join-Path $env:APPDATA 'Oynx'
+          New-Item -ItemType Directory -Force -Path $themeDir | Out-Null
+          $theme = Join-Path $themeDir 'theme.json'
+          '{"mode":"Light","window_opacity":0.8,"window_blur":true}' | Set-Content -LiteralPath $theme -Encoding utf8NoBOM
+          $exe = (Resolve-Path 'target\release\oynx.exe').Path
+          $stdout = Join-Path $env:RUNNER_TEMP 'oynx-stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'oynx-stderr.log'
+          $app = Start-Process -FilePath $exe -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          try {
+            Start-Sleep -Seconds 8
+            if ($app.HasExited) {
+              throw "oynx.exe exited during startup with a transparent theme (code $($app.ExitCode))"
+            }
+            $global:LASTEXITCODE = 0
+            & .\scripts\assert-window.ps1 -ProcessId $app.Id -ExpectedTitle 'Oynx' -TimeoutSeconds 60
+            if ($LASTEXITCODE -ne 0) {
+              throw 'With a transparent theme the app stayed alive but never showed an "Oynx" window.'
+            }
+            Write-Host "PASS: transparent theme window is up as PID $($app.Id)."
+          }
+          finally {
+            if (-not $app.HasExited) {
+              Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $theme -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Report why the launch failed
         if: failure()
         shell: pwsh
