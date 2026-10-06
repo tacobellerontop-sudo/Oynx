@@ -38,6 +38,7 @@ The waveform beside the lyrics on the Now Playing screen is a live spectrum of t
 - **Artist and album pages** show an artist's popular songs, albums and singles, and an album's full track list.
 - **Your top songs and artists** in the Library shows what you've played most over the last month, six months and year.
 - **Recently played** in the queue panel's menu lists what this account played lately, on any device.
+- **Lyrics sources**: pick where lyrics come from in **Settings > Lyrics**, or from the link beside the Lyrics tab: Spotify's own lyrics (mostly Musixmatch), [LRCLIB](https://lrclib.net), or NetEase Cloud Music, which is strong on Chinese, Japanese and Korean songs. **Auto** tries them in that order and prefers lyrics timed to the song.
 - **Sleep timer** in the player's **…** menu pauses playback after 5 to 90 minutes or at the end of the song.
 
 ## Themes

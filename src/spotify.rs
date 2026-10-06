@@ -35,6 +35,7 @@ use tokio::sync::{Mutex as TokioMutex, Semaphore, mpsc as tokio_mpsc};
 use crate::{
     audio::AudioTaps,
     credits::{self, CreditsQuery, SongCredits},
+    lyrics::{self, FoundLyrics, LyricsSource},
 };
 
 const DEFAULT_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
@@ -748,61 +749,6 @@ impl WebApiClient {
             rgba: rgba.into_raw(),
         })
     }
-
-    async fn fetch_lyrics(
-        &self,
-        artist: &str,
-        title: &str,
-        album: &str,
-        duration_ms: u32,
-    ) -> Result<(Vec<LyricLine>, bool), String> {
-        let params = [
-            ("artist_name".to_owned(), artist.to_owned()),
-            ("track_name".to_owned(), title.to_owned()),
-            ("album_name".to_owned(), album.to_owned()),
-            ("duration".to_owned(), (duration_ms / 1000).to_string()),
-        ];
-        let response = self
-            .http
-            .get("https://lrclib.net/api/get")
-            .query(&params)
-            .header("User-Agent", "Oynx/0.1 (desktop Spotify client)")
-            .send()
-            .await
-            .map_err(|error| format!("Lyrics request failed: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "Lyrics service returned HTTP {}",
-                response.status()
-            ));
-        }
-        let value: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| format!("Could not read lyrics response: {error}"))?;
-        if let Some(synced) = value["syncedLyrics"]
-            .as_str()
-            .filter(|text| !text.is_empty())
-        {
-            return Ok((parse_lrc(synced), true));
-        }
-        if let Some(plain) = value["plainLyrics"]
-            .as_str()
-            .filter(|text| !text.is_empty())
-        {
-            return Ok((
-                plain
-                    .lines()
-                    .map(|line| LyricLine {
-                        timestamp_ms: 0,
-                        text: line.to_owned(),
-                    })
-                    .collect(),
-                false,
-            ));
-        }
-        Err("No lyrics were found for this track.".to_owned())
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -953,6 +899,8 @@ pub enum PlaybackEvent {
         track_id: String,
         lines: Vec<LyricLine>,
         synced: bool,
+        /// Where the lyrics came from, such as "LRCLIB".
+        provider: Option<String>,
         error: Option<String>,
     },
     ArtworkReady {
@@ -1033,6 +981,7 @@ enum PlaybackCommand {
         title: String,
         album: String,
         duration_ms: u32,
+        source: LyricsSource,
     },
     LoadArtwork {
         url: String,
@@ -1180,6 +1129,7 @@ impl SpotifyClient {
         title: String,
         album: String,
         duration_ms: u32,
+        source: LyricsSource,
     ) {
         let _ = self.command_tx.send(PlaybackCommand::LoadLyrics {
             track_id,
@@ -1187,6 +1137,7 @@ impl SpotifyClient {
             title,
             album,
             duration_ms,
+            source,
         });
     }
 
@@ -1520,25 +1471,40 @@ fn run_worker(
                     title,
                     album,
                     duration_ms,
+                    source,
                 } => {
                     if let Some(player) = connected.as_ref() {
+                        let session = player.session.clone();
                         spawn_api_job(
                             player.web_api.clone(),
                             events.clone(),
                             api_permits.clone(),
                             move |api, events| async move {
-                                let result =
-                                    api.fetch_lyrics(&artist, &title, &album, duration_ms).await;
-                                let (lines, synced, error) = match result {
-                                    Ok((lines, synced)) => (lines, synced, None),
-                                    Err(error) => (Vec::new(), false, Some(error)),
+                                let song = SongForLyrics {
+                                    track_id: &track_id,
+                                    artist: &artist,
+                                    title: &title,
+                                    album: &album,
+                                    duration_ms,
                                 };
-                                let _ = events.send(PlaybackEvent::Lyrics {
-                                    track_id,
-                                    lines,
-                                    synced,
-                                    error,
-                                });
+                                let result = find_lyrics(&api.http, &session, source, &song).await;
+                                let event = match result {
+                                    Ok(found) => PlaybackEvent::Lyrics {
+                                        track_id,
+                                        lines: found.lines,
+                                        synced: found.synced,
+                                        provider: Some(found.provider),
+                                        error: None,
+                                    },
+                                    Err(error) => PlaybackEvent::Lyrics {
+                                        track_id,
+                                        lines: Vec::new(),
+                                        synced: false,
+                                        provider: None,
+                                        error: Some(error),
+                                    },
+                                };
+                                let _ = events.send(event);
                             },
                         );
                     }
@@ -2285,7 +2251,7 @@ fn map_search_track(track: SearchTrack) -> SpotifyTrack {
     }
 }
 
-fn parse_lrc(lrc: &str) -> Vec<LyricLine> {
+pub(crate) fn parse_lrc(lrc: &str) -> Vec<LyricLine> {
     let mut lines = Vec::new();
     for line in lrc.lines() {
         let mut rest = line;
@@ -2664,6 +2630,62 @@ async fn load_liked_songs(client: &WebApiClient, events: &Sender<PlaybackEvent>)
     let _ = events.send(PlaybackEvent::LikedSongs { tracks });
     if let Some(message) = error_message {
         let _ = events.send(PlaybackEvent::LikedSongsError { message });
+    }
+}
+
+struct SongForLyrics<'a> {
+    track_id: &'a str,
+    artist: &'a str,
+    title: &'a str,
+    album: &'a str,
+    duration_ms: u32,
+}
+
+/// Looks lyrics up in the chosen source, or in each source in turn for Auto.
+async fn find_lyrics(
+    http: &reqwest::Client,
+    session: &Session,
+    source: LyricsSource,
+    song: &SongForLyrics<'_>,
+) -> Result<FoundLyrics, String> {
+    if source != LyricsSource::Auto {
+        return lyrics_from(http, session, source, song).await;
+    }
+    let mut results = Vec::new();
+    for source in LyricsSource::AUTO_ORDER {
+        let result = lyrics_from(http, session, source, song).await;
+        let synced = matches!(&result, Ok(found) if found.synced);
+        results.push(result);
+        if synced {
+            break;
+        }
+    }
+    lyrics::choose_auto(results)
+}
+
+async fn lyrics_from(
+    http: &reqwest::Client,
+    session: &Session,
+    source: LyricsSource,
+    song: &SongForLyrics<'_>,
+) -> Result<FoundLyrics, String> {
+    match source {
+        LyricsSource::Spotify => {
+            let id = SpotifyId::from_base62(song.track_id)
+                .map_err(|error| format!("Invalid Spotify track ID: {error}"))?;
+            // Spotify answers 404 for songs it has no lyrics for.
+            let body = session
+                .spclient()
+                .get_lyrics(&id)
+                .await
+                .map_err(|_| "Spotify has no lyrics for this track.".to_owned())?;
+            lyrics::parse_spotify(&body).ok_or_else(|| "Spotify has no lyrics for this track.".to_owned())
+        }
+        LyricsSource::Lrclib => {
+            lyrics::lrclib(http, song.artist, song.title, song.album, song.duration_ms).await
+        }
+        LyricsSource::NetEase => lyrics::netease(http, song.artist, song.title, song.duration_ms).await,
+        LyricsSource::Auto => Err("Auto is not a single source.".to_owned()),
     }
 }
 

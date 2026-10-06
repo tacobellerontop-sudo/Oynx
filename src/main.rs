@@ -5,6 +5,7 @@
 
 mod audio;
 mod credits;
+mod lyrics;
 mod spotify;
 mod theme;
 mod tray;
@@ -18,6 +19,7 @@ use std::{
 };
 
 use crate::credits::{SongCredits, SongLink};
+use crate::lyrics::LyricsSource;
 use crate::spotify::{
     ConnectionState, LyricLine, PlaybackEvent, RepeatMode, SpotifyAlbum, SpotifyArtist,
     SpotifyClient, SpotifyConfig, SpotifyPlaylist, SpotifyTrack, TopRange,
@@ -107,6 +109,7 @@ struct UiPrefs {
     update_mode: UpdateMode,
     /// Whether closing the window hides Oynx in the system tray instead of quitting.
     close_to_tray: bool,
+    lyrics_source: LyricsSource,
 }
 
 impl Default for UiPrefs {
@@ -117,6 +120,7 @@ impl Default for UiPrefs {
             player_height: PLAYER_HEIGHT,
             update_mode: UpdateMode::default(),
             close_to_tray: true,
+            lyrics_source: LyricsSource::Auto,
         }
     }
 }
@@ -465,6 +469,8 @@ struct OynxApp {
     lyrics_synced: bool,
     lyrics_loading: bool,
     lyrics_error: Option<String>,
+    /// Who provided the lyrics on screen, such as "LRCLIB".
+    lyrics_provider: Option<String>,
     lyrics_track_id: Option<String>,
     position_ms: u32,
     artwork_textures: HashMap<String, egui::TextureHandle>,
@@ -829,6 +835,7 @@ impl OynxApp {
             lyrics_synced: false,
             lyrics_loading: false,
             lyrics_error: None,
+            lyrics_provider: None,
             lyrics_track_id: None,
             position_ms: initial_position_ms,
             artwork_textures: HashMap::new(),
@@ -1139,6 +1146,7 @@ impl OynxApp {
         self.lyrics_synced = false;
         self.lyrics_loading = true;
         self.lyrics_error = None;
+        self.lyrics_provider = None;
         let duration_ms = track.duration_ms();
         self.spotify.load_lyrics(
             track_id,
@@ -1146,7 +1154,19 @@ impl OynxApp {
             track.title,
             track.album,
             duration_ms,
+            self.prefs.lyrics_source,
         );
+    }
+
+    /// Switches where lyrics come from and reloads the current song's lyrics.
+    fn set_lyrics_source(&mut self, source: LyricsSource) {
+        if self.prefs.lyrics_source == source {
+            return;
+        }
+        self.prefs.lyrics_source = source;
+        if let Some(track_id) = self.current_track_id() {
+            self.request_lyrics_for_id(track_id, true);
+        }
     }
 
     fn request_lyrics_for_current(&mut self) {
@@ -1388,12 +1408,14 @@ impl OynxApp {
                     track_id,
                     lines,
                     synced,
+                    provider,
                     error,
                 } => {
                     if self.lyrics_track_id.as_deref() == Some(track_id.as_str()) {
                         self.lyrics_loading = false;
                         self.lyrics = lines;
                         self.lyrics_synced = synced;
+                        self.lyrics_provider = provider;
                         self.lyrics_error = error;
                     }
                 }
@@ -4456,6 +4478,17 @@ impl OynxApp {
         }
 
         ui.add_space(16.0);
+        Self::settings_card(ui, "Lyrics", |ui| {
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for source in LyricsSource::ALL {
+                if option_row(ui, source.label(), source.detail(), self.prefs.lyrics_source == source).clicked() {
+                    self.set_lyrics_source(source);
+                }
+            }
+        });
+
+        ui.add_space(16.0);
         let tray_available = self.tray.is_some();
         Self::settings_card(ui, "When closing", |ui| {
             ui.add_space(4.0);
@@ -4888,7 +4921,10 @@ impl OynxApp {
             pal().subtle,
             2.6,
         );
-        let tabs = egui::Rect::from_min_size(rect.left_top() + egui::vec2(132.0, -2.0), egui::vec2(260.0, 30.0));
+        let tabs = egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(132.0, -2.0),
+            egui::vec2((rect.width() - 132.0).max(160.0), 30.0),
+        );
         let mut tabs_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(tabs)
@@ -4899,6 +4935,34 @@ impl OynxApp {
             if chip(&mut tabs_ui, label, self.now_playing_tab == tab).clicked() {
                 self.now_playing_tab = tab;
             }
+        }
+        if self.now_playing_tab == NowPlayingTab::Lyrics {
+            // Where the lyrics came from, and a menu to pick another source.
+            tabs_ui.add_space(6.0);
+            let label = match (&self.lyrics_provider, self.prefs.lyrics_source) {
+                (Some(provider), _) => format!("From {provider}"),
+                (None, LyricsSource::Auto) => "Choose lyrics source".to_owned(),
+                (None, source) => format!("From {}", source.label()),
+            };
+            let source_button = text_link(&mut tabs_ui, &label).on_hover_text("Choose where lyrics come from");
+            egui::Popup::from_toggle_button_response(&source_button)
+                .kind(egui::PopupKind::Menu)
+                .align(egui::RectAlign::BOTTOM_START)
+                .gap(4.0)
+                .width(230.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                .frame(menu_frame())
+                .show(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for source in LyricsSource::ALL {
+                        if menu_item(ui, Icon::Note, source.label(), self.prefs.lyrics_source == source)
+                            .on_hover_text(source.detail())
+                            .clicked()
+                        {
+                            self.set_lyrics_source(source);
+                        }
+                    }
+                });
         }
         let show_visualizer = rect.width() >= 520.0;
         let visualizer_x = rect.left() + (rect.width() * 0.76).min(rect.width() - 110.0);
