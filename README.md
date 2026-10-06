@@ -30,6 +30,17 @@ By default, closing the window hides Oynx to the system tray instead of quitting
 
 The waveform beside the lyrics on the Now Playing screen is a live spectrum of the audio you hear, with bass in the middle and treble towards the ends. It is timed to the speakers rather than the decoder, so it stays in step with the music. The button at the bottom left opens a ten-band equaliser with presets; changes apply within a moment and are saved to `%APPDATA%Oynxqualizer.json`.
 
+## Exploring music
+
+- **Song credits**: the **Credits** tab on the Now Playing screen (or **Song credits** in the player's **…** menu) shows who wrote, produced, mixed and played on the song, the songs it samples, the songs that sample it, and other recordings of it. Click a name or song to search for it. Spotify's own SongDNA isn't available to other apps, so Oynx combines the credits in Spotify's track data with [MusicBrainz](https://musicbrainz.org), the open music encyclopedia; songs MusicBrainz doesn't know yet show fewer credits.
+- **Song menu**: hover a song and click **…**, or right-click it, to play it next, add it to the queue, start a song radio, add it to one of your playlists, go to its artist or album, or copy its link. The player's **…** menu has the same actions for the song that's playing.
+- **Song radio** plays songs like the one you picked, chosen by Spotify.
+- **Artist and album pages** show an artist's popular songs, albums and singles, and an album's full track list.
+- **Your top songs and artists** in the Library shows what you've played most over the last month, six months and year.
+- **Recently played** in the queue panel's menu lists what this account played lately, on any device.
+- **Lyrics sources**: pick where lyrics come from in **Settings > Lyrics**, or from the link beside the Lyrics tab: Spotify's own lyrics (mostly Musixmatch), [LRCLIB](https://lrclib.net), or NetEase Cloud Music, which is strong on Chinese, Japanese and Korean songs. **Auto** tries them in that order and prefers lyrics timed to the song.
+- **Sleep timer** in the player's **…** menu pauses playback after 5 to 90 minutes or at the end of the song.
+
 ## Themes
 
 **Settings > Themes** changes how Oynx looks:
@@ -67,7 +78,7 @@ $env:OYNX_SPOTIFY_WEB_API_CLIENT_ID = "your-separate-web-api-client-id"
 $env:OYNX_SPOTIFY_WEB_API_REDIRECT_URI = "http://127.0.0.1:8989/login"
 ```
 
-Oynx requests `user-library-read`, `user-library-modify`, playlist-read, `user-top-read`, and streaming permissions during sign-in. If you already signed in with an older build, use **Sign out** and sign in again once so Spotify can grant the new scopes.
+Oynx requests `user-library-read`, `user-library-modify`, playlist-read, `user-top-read`, and streaming permissions during sign-in, plus `user-read-recently-played` and playlist-modify for Recently played and Add to playlist. If you signed in with a build older than 1.2.0, everything else keeps working; use **Sign out** and sign in again once to turn on those two features.
 
 Librespot requires a Spotify Premium account. Reusable credentials, the Web API refresh token, and the audio cache are stored locally by Oynx/Librespot under:
 

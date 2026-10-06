@@ -4,6 +4,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod credits;
+mod lyrics;
 mod spotify;
 mod theme;
 mod tray;
@@ -16,9 +18,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::credits::{SongCredits, SongLink};
+use crate::lyrics::LyricsSource;
 use crate::spotify::{
-    ConnectionState, LyricLine, PlaybackEvent, RepeatMode, SpotifyClient, SpotifyConfig,
-    SpotifyPlaylist, SpotifyTrack,
+    ConnectionState, LyricLine, PlaybackEvent, RepeatMode, SpotifyAlbum, SpotifyArtist,
+    SpotifyClient, SpotifyConfig, SpotifyPlaylist, SpotifyTrack, TopRange,
 };
 use crate::audio::{AudioTaps, EQ_FREQUENCIES_HZ, EqualizerPreset, EqualizerSettings, MAX_EQ_GAIN_DB, MIN_EQ_GAIN_DB, NUM_BANDS, NUM_EQ_BANDS};
 use crate::theme::{ColorRole, ThemeMode, ThemeSettings, pal};
@@ -105,6 +109,7 @@ struct UiPrefs {
     update_mode: UpdateMode,
     /// Whether closing the window hides Oynx in the system tray instead of quitting.
     close_to_tray: bool,
+    lyrics_source: LyricsSource,
 }
 
 impl Default for UiPrefs {
@@ -115,6 +120,7 @@ impl Default for UiPrefs {
             player_height: PLAYER_HEIGHT,
             update_mode: UpdateMode::default(),
             close_to_tray: true,
+            lyrics_source: LyricsSource::Auto,
         }
     }
 }
@@ -163,6 +169,85 @@ enum ThemeFile {
 enum RightPanelTab {
     Queue,
     Recent,
+}
+
+/// What the Now Playing view shows beside the waveform.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NowPlayingTab {
+    Lyrics,
+    Credits,
+}
+
+enum CreditsState {
+    Loading,
+    Ready(SongCredits),
+    Failed(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SleepTimer {
+    /// Pause when this moment arrives.
+    At(Instant),
+    /// Pause when the current song ends.
+    EndOfTrack,
+}
+
+/// A page opened from a song or the library: its tracks live in `tracks`.
+#[derive(Clone)]
+enum DetailPage {
+    Artist {
+        id: String,
+        name: String,
+        image_url: Option<String>,
+        albums: Vec<SpotifyAlbum>,
+        loading: bool,
+        error: Option<String>,
+    },
+    Album {
+        id: String,
+        name: String,
+        artist: String,
+        artist_id: Option<String>,
+        year: Option<i32>,
+        image_url: Option<String>,
+        loading: bool,
+        error: Option<String>,
+    },
+    Radio {
+        seed_id: String,
+        title: String,
+        artist: String,
+        image_url: Option<String>,
+        loading: bool,
+        error: Option<String>,
+    },
+    Top {
+        range: TopRange,
+        artists: Vec<SpotifyArtist>,
+        loading: bool,
+        error: Option<String>,
+    },
+}
+
+impl DetailPage {
+    /// Identifies the page for the page transition.
+    fn key(&self) -> String {
+        match self {
+            Self::Artist { id, .. } => format!("artist:{id}"),
+            Self::Album { id, .. } => format!("album:{id}"),
+            Self::Radio { seed_id, .. } => format!("radio:{seed_id}"),
+            Self::Top { range, .. } => format!("top:{range:?}"),
+        }
+    }
+
+    fn source_label(&self) -> String {
+        match self {
+            Self::Artist { name, .. } => format!("Artist · {name}"),
+            Self::Album { name, .. } => format!("Album · {name}"),
+            Self::Radio { title, .. } => format!("Song radio · {title}"),
+            Self::Top { range, .. } => format!("Your top songs · {}", range.label()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -217,6 +302,8 @@ struct Track {
     duration: String,
     artwork: Artwork,
     image_url: Option<String>,
+    artist_id: Option<String>,
+    album_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -226,6 +313,8 @@ struct Playlist {
     description: String,
     artwork: Artwork,
     image_url: Option<String>,
+    owner_id: Option<String>,
+    collaborative: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -236,6 +325,10 @@ struct SavedTrack {
     album: String,
     duration_ms: u32,
     image_url: Option<String>,
+    #[serde(default)]
+    artist_id: Option<String>,
+    #[serde(default)]
+    album_id: Option<String>,
 }
 
 impl SavedTrack {
@@ -247,6 +340,8 @@ impl SavedTrack {
             album: track.album.clone(),
             duration_ms: track.duration_ms(),
             image_url: track.image_url.clone(),
+            artist_id: track.artist_id.clone(),
+            album_id: track.album_id.clone(),
         }
     }
 
@@ -258,6 +353,8 @@ impl SavedTrack {
             duration: format_duration(self.duration_ms),
             artwork: OynxApp::artwork_for_index(index),
             image_url: self.image_url.clone(),
+            artist_id: self.artist_id.clone(),
+            album_id: self.album_id.clone(),
         }
     }
 }
@@ -372,6 +469,8 @@ struct OynxApp {
     lyrics_synced: bool,
     lyrics_loading: bool,
     lyrics_error: Option<String>,
+    /// Who provided the lyrics on screen, such as "LRCLIB".
+    lyrics_provider: Option<String>,
     lyrics_track_id: Option<String>,
     position_ms: u32,
     artwork_textures: HashMap<String, egui::TextureHandle>,
@@ -445,6 +544,21 @@ struct OynxApp {
     lyrics_follow: Option<(Option<String>, usize)>,
     /// While set, the listener is scrolling the lyrics and auto-follow is paused.
     lyrics_manual_until: Option<Instant>,
+    /// An artist, album, radio or top-songs page open in the library.
+    detail: Option<DetailPage>,
+    now_playing_tab: NowPlayingTab,
+    /// Song credits by Spotify track ID.
+    credits: HashMap<String, CreditsState>,
+    recent_tracks: Vec<Track>,
+    recent_ids: Vec<String>,
+    recent_loading: bool,
+    recent_error: Option<String>,
+    recent_loaded_at: Option<Instant>,
+    sleep_timer: Option<SleepTimer>,
+    /// A short confirmation, such as "Added to queue", and when it was shown.
+    notice: Option<(String, Instant)>,
+    /// Whether `tracks` holds the open detail page's songs yet.
+    detail_has_tracks: bool,
 }
 
 impl OynxApp {
@@ -510,6 +624,8 @@ impl OynxApp {
                     pattern: 0,
                 },
                 image_url: None,
+                artist_id: None,
+                album_id: None,
             },
             Track {
                 title: "Never Gonna Give You Up".into(),
@@ -520,6 +636,8 @@ impl OynxApp {
                     pattern: 1,
                 },
                 image_url: None,
+                artist_id: None,
+                album_id: None,
             },
             Track {
                 title: "All I Want".into(),
@@ -530,6 +648,8 @@ impl OynxApp {
                     pattern: 2,
                 },
                 image_url: None,
+                artist_id: None,
+                album_id: None,
             },
             Track {
                 title: "Borderline".into(),
@@ -540,6 +660,8 @@ impl OynxApp {
                     pattern: 3,
                 },
                 image_url: None,
+                artist_id: None,
+                album_id: None,
             },
             Track {
                 title: "A New Error".into(),
@@ -550,6 +672,8 @@ impl OynxApp {
                     pattern: 0,
                 },
                 image_url: None,
+                artist_id: None,
+                album_id: None,
             },
             Track {
                 title: "Outro".into(),
@@ -560,6 +684,8 @@ impl OynxApp {
                     pattern: 1,
                 },
                 image_url: None,
+                artist_id: None,
+                album_id: None,
             },
             Track {
                 title: "Billie Jean".into(),
@@ -570,6 +696,8 @@ impl OynxApp {
                     pattern: 3,
                 },
                 image_url: None,
+                artist_id: None,
+                album_id: None,
             },
         ];
 
@@ -582,6 +710,8 @@ impl OynxApp {
                     pattern: 2,
                 },
                 image_url: None,
+                owner_id: None,
+                collaborative: false,
             },
             Playlist {
                 id: String::new(),
@@ -591,6 +721,8 @@ impl OynxApp {
                     pattern: 0,
                 },
                 image_url: None,
+                owner_id: None,
+                collaborative: false,
             },
             Playlist {
                 id: String::new(),
@@ -600,6 +732,8 @@ impl OynxApp {
                     pattern: 3,
                 },
                 image_url: None,
+                owner_id: None,
+                collaborative: false,
             },
             Playlist {
                 id: String::new(),
@@ -609,6 +743,8 @@ impl OynxApp {
                     pattern: 1,
                 },
                 image_url: None,
+                owner_id: None,
+                collaborative: false,
             },
         ];
 
@@ -699,6 +835,7 @@ impl OynxApp {
             lyrics_synced: false,
             lyrics_loading: false,
             lyrics_error: None,
+            lyrics_provider: None,
             lyrics_track_id: None,
             position_ms: initial_position_ms,
             artwork_textures: HashMap::new(),
@@ -761,6 +898,17 @@ impl OynxApp {
             queue_expanded: false,
             lyrics_follow: None,
             lyrics_manual_until: None,
+            detail: None,
+            now_playing_tab: NowPlayingTab::Lyrics,
+            credits: HashMap::new(),
+            recent_tracks: Vec::new(),
+            recent_ids: Vec::new(),
+            recent_loading: false,
+            recent_error: None,
+            recent_loaded_at: None,
+            sleep_timer: None,
+            notice: None,
+            detail_has_tracks: false,
         }
     }
 
@@ -773,6 +921,9 @@ impl OynxApp {
     }
 
     fn source_label(&self) -> String {
+        if let Some(detail) = &self.detail {
+            return detail.source_label();
+        }
         if let Some(name) = &self.playlist_name {
             return format!("Playlist · {name}");
         }
@@ -995,6 +1146,7 @@ impl OynxApp {
         self.lyrics_synced = false;
         self.lyrics_loading = true;
         self.lyrics_error = None;
+        self.lyrics_provider = None;
         let duration_ms = track.duration_ms();
         self.spotify.load_lyrics(
             track_id,
@@ -1002,7 +1154,19 @@ impl OynxApp {
             track.title,
             track.album,
             duration_ms,
+            self.prefs.lyrics_source,
         );
+    }
+
+    /// Switches where lyrics come from and reloads the current song's lyrics.
+    fn set_lyrics_source(&mut self, source: LyricsSource) {
+        if self.prefs.lyrics_source == source {
+            return;
+        }
+        self.prefs.lyrics_source = source;
+        if let Some(track_id) = self.current_track_id() {
+            self.request_lyrics_for_id(track_id, true);
+        }
     }
 
     fn request_lyrics_for_current(&mut self) {
@@ -1050,6 +1214,13 @@ impl OynxApp {
                         self.playlist_name = None;
                         self.playlist_loading = false;
                         self.playlist_error = None;
+                        self.detail = None;
+                        self.credits.clear();
+                        self.recent_tracks.clear();
+                        self.recent_ids.clear();
+                        self.recent_loaded_at = None;
+                        self.recent_loading = false;
+                        self.sleep_timer = None;
                         self.pending_artwork.clear();
                         self.artwork_retry_after.clear();
                         self.artwork_queue.clear();
@@ -1091,6 +1262,9 @@ impl OynxApp {
                     self.playlist_name = None;
                     self.playlist_loading = false;
                     self.playlist_error = None;
+                    self.detail = None;
+                    self.recent_loaded_at = None;
+                    self.recent_loading = false;
                     self.spotify.set_volume(self.volume);
                     self.spotify.set_shuffle(self.shuffle);
                     self.spotify.set_repeat(self.repeat);
@@ -1234,12 +1408,14 @@ impl OynxApp {
                     track_id,
                     lines,
                     synced,
+                    provider,
                     error,
                 } => {
                     if self.lyrics_track_id.as_deref() == Some(track_id.as_str()) {
                         self.lyrics_loading = false;
                         self.lyrics = lines;
                         self.lyrics_synced = synced;
+                        self.lyrics_provider = provider;
                         self.lyrics_error = error;
                     }
                 }
@@ -1262,6 +1438,156 @@ impl OynxApp {
                     self.pending_artwork.remove(&url);
                     self.artwork_retry_after
                         .insert(url, Instant::now() + Duration::from_secs(30));
+                }
+                PlaybackEvent::ArtistPage {
+                    artist_id,
+                    name,
+                    image_url,
+                    tracks,
+                    albums,
+                    error,
+                } => {
+                    if let Some(DetailPage::Artist { id, .. }) = &self.detail
+                        && *id == artist_id
+                    {
+                        if let Some(url) = &image_url {
+                            self.request_artwork(url);
+                        }
+                        for album in &albums {
+                            if let Some(url) = &album.image_url {
+                                self.request_artwork(url);
+                            }
+                        }
+                        self.apply_detail_tracks(tracks);
+                        self.detail = Some(DetailPage::Artist {
+                            id: artist_id,
+                            name,
+                            image_url,
+                            albums,
+                            loading: false,
+                            error,
+                        });
+                    }
+                }
+                PlaybackEvent::AlbumPage {
+                    album_id,
+                    name,
+                    artist,
+                    artist_id,
+                    year,
+                    image_url,
+                    tracks,
+                    error,
+                } => {
+                    if let Some(DetailPage::Album {
+                        id,
+                        name: open_name,
+                        artist: open_artist,
+                        ..
+                    }) = self.detail.clone()
+                        && id == album_id
+                    {
+                        // A failed load keeps the name and artist the page opened with.
+                        let name = if name.is_empty() { open_name } else { name };
+                        let artist = if artist.is_empty() { open_artist } else { artist };
+                        if let Some(url) = &image_url {
+                            self.request_artwork(url);
+                        }
+                        self.apply_detail_tracks(tracks);
+                        self.detail = Some(DetailPage::Album {
+                            id: album_id,
+                            name,
+                            artist,
+                            artist_id,
+                            year,
+                            image_url,
+                            loading: false,
+                            error,
+                        });
+                    }
+                }
+                PlaybackEvent::RecentlyPlayed { tracks, error } => {
+                    self.recent_loading = false;
+                    self.recent_error = error;
+                    if self.recent_error.is_none() {
+                        for track in &tracks {
+                            if let Some(url) = &track.image_url {
+                                self.request_artwork(url);
+                            }
+                        }
+                        self.recent_ids = tracks.iter().map(|track| track.id.clone()).collect();
+                        self.recent_tracks = Self::map_spotify_tracks(tracks).0;
+                    }
+                }
+                PlaybackEvent::TopItems {
+                    range,
+                    tracks,
+                    artists,
+                    error,
+                } => {
+                    if let Some(DetailPage::Top { range: open_range, .. }) = &self.detail
+                        && *open_range == range
+                    {
+                        for artist in &artists {
+                            if let Some(url) = &artist.image_url {
+                                self.request_artwork(url);
+                            }
+                        }
+                        self.apply_detail_tracks(tracks);
+                        self.detail = Some(DetailPage::Top {
+                            range,
+                            artists,
+                            loading: false,
+                            error,
+                        });
+                    }
+                }
+                PlaybackEvent::Credits { track_id, result } => {
+                    let state = match result {
+                        Ok(credits) => CreditsState::Ready(credits),
+                        Err(error) => CreditsState::Failed(error),
+                    };
+                    self.credits.insert(track_id, state);
+                }
+                PlaybackEvent::Radio {
+                    seed_track_id,
+                    tracks,
+                    error,
+                } => {
+                    if let Some(DetailPage::Radio {
+                        seed_id,
+                        title,
+                        artist,
+                        image_url,
+                        ..
+                    }) = self.detail.clone()
+                        && seed_id == seed_track_id
+                    {
+                        let start = error.is_none() && !tracks.is_empty();
+                        if start {
+                            self.apply_detail_tracks(tracks);
+                        }
+                        self.detail = Some(DetailPage::Radio {
+                            seed_id,
+                            title,
+                            artist,
+                            image_url,
+                            loading: false,
+                            error,
+                        });
+                        if start {
+                            self.play_track(0);
+                        }
+                    }
+                }
+                PlaybackEvent::Notice(message) => {
+                    self.show_notice(&message);
+                }
+                PlaybackEvent::Ended if self.sleep_timer == Some(SleepTimer::EndOfTrack) => {
+                    self.sleep_timer = None;
+                    self.playing = false;
+                    self.save_session();
+                    self.show_notice("Sleep timer paused playback");
                 }
                 PlaybackEvent::Ended => {
                     let has_queue = if self.queue_active {
@@ -1320,6 +1646,9 @@ impl OynxApp {
     }
 
     fn apply_search_results(&mut self, spotify_tracks: Vec<SpotifyTrack>) {
+        if self.detail.is_some() {
+            return;
+        }
         if spotify_tracks.is_empty() {
             self.connection_error = Some("Spotify returned no tracks for that search.".into());
             return;
@@ -1330,7 +1659,7 @@ impl OynxApp {
     }
 
     fn apply_recommendations(&mut self, spotify_tracks: Vec<SpotifyTrack>) {
-        if self.section == Section::LikedSongs && self.liked_songs_loaded {
+        if (self.section == Section::LikedSongs && self.liked_songs_loaded) || self.detail.is_some() {
             return;
         }
         if spotify_tracks.is_empty() {
@@ -1379,11 +1708,16 @@ impl OynxApp {
                 },
                 artwork: Self::artwork_for_index(index),
                 image_url: playlist.image_url,
+                owner_id: playlist.owner_id,
+                collaborative: playlist.collaborative,
             })
             .collect();
     }
 
     fn apply_playlist_tracks(&mut self, spotify_tracks: Vec<SpotifyTrack>) {
+        if self.detail.is_some() {
+            return;
+        }
         self.playlist_loading = false;
         self.playlist_error = None;
         if spotify_tracks.is_empty() {
@@ -1409,6 +1743,8 @@ impl OynxApp {
                     duration: format_duration(track.duration_ms),
                     artwork: Self::artwork_for_index(index),
                     image_url: track.image_url,
+                    artist_id: track.artist_id,
+                    album_id: track.album_id,
                 }
             })
             .collect();
@@ -1519,12 +1855,275 @@ impl OynxApp {
             self.section = Section::Library;
             return;
         }
+        self.detail = None;
         self.playlist_name = Some(playlist.title.clone());
         self.playlist_loading = true;
         self.playlist_error = None;
         self.section = Section::Library;
         self.connection_error = None;
         self.spotify.load_playlist(playlist.id.clone());
+    }
+
+    fn spotify_ready(&mut self) -> bool {
+        let ready = self.connection_state == ConnectionState::Ready;
+        if !ready {
+            self.connection_error = Some("Sign in to Spotify first.".to_owned());
+        }
+        ready
+    }
+
+    fn open_detail(&mut self, detail: DetailPage) {
+        self.section = Section::Library;
+        self.playlist_name = None;
+        self.playlist_loading = false;
+        self.playlist_error = None;
+        self.connection_error = None;
+        self.detail = Some(detail);
+        self.detail_has_tracks = false;
+    }
+
+    /// Shows a detail page's songs. `tracks` is never left empty, because the
+    /// player falls back to it for the current song.
+    fn apply_detail_tracks(&mut self, tracks: Vec<SpotifyTrack>) {
+        if tracks.is_empty() {
+            self.detail_has_tracks = false;
+        } else {
+            self.replace_tracks(tracks);
+            self.detail_has_tracks = true;
+        }
+    }
+
+    fn open_artist(&mut self, artist_id: String, name: String) {
+        if !self.spotify_ready() {
+            return;
+        }
+        self.open_detail(DetailPage::Artist {
+            id: artist_id.clone(),
+            name: name.clone(),
+            image_url: None,
+            albums: Vec::new(),
+            loading: true,
+            error: None,
+        });
+        self.spotify.load_artist(artist_id, name);
+    }
+
+    fn open_album(&mut self, album_id: String, name: String, artist: String) {
+        if !self.spotify_ready() {
+            return;
+        }
+        self.open_detail(DetailPage::Album {
+            id: album_id.clone(),
+            name,
+            artist,
+            artist_id: None,
+            year: None,
+            image_url: None,
+            loading: true,
+            error: None,
+        });
+        self.spotify.load_album(album_id);
+    }
+
+    fn open_top(&mut self, range: TopRange) {
+        if !self.spotify_ready() {
+            return;
+        }
+        let artists = match &self.detail {
+            Some(DetailPage::Top { artists, .. }) => artists.clone(),
+            _ => Vec::new(),
+        };
+        self.open_detail(DetailPage::Top {
+            range,
+            artists,
+            loading: true,
+            error: None,
+        });
+        self.spotify.load_top(range);
+    }
+
+    fn start_radio(&mut self, track: &Track, track_id: String) {
+        if !self.spotify_ready() {
+            return;
+        }
+        self.open_detail(DetailPage::Radio {
+            seed_id: track_id.clone(),
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            image_url: track.image_url.clone(),
+            loading: true,
+            error: None,
+        });
+        self.spotify.start_radio(track_id);
+    }
+
+    /// Runs a Spotify search from anywhere, such as a name in the song credits.
+    fn search_for(&mut self, query: &str) {
+        let query = query.trim();
+        if query.is_empty() || !self.spotify_ready() {
+            return;
+        }
+        self.detail = None;
+        self.playlist_name = None;
+        self.section = Section::Search;
+        self.search = query.to_owned();
+        self.spotify.search(query.to_owned());
+    }
+
+    /// Plays a list that is not the page on screen, such as Recently played.
+    fn play_list(&mut self, tracks: Vec<Track>, ids: Vec<String>, index: usize, source: &str) {
+        let Some(track_id) = ids.get(index).cloned() else {
+            return;
+        };
+        if !self.spotify_ready() {
+            return;
+        }
+        for url in tracks.iter().filter_map(|track| track.image_url.clone()) {
+            self.request_artwork(&url);
+        }
+        self.queue_tracks = tracks;
+        self.queue_spotify_ids = ids.iter().cloned().enumerate().collect();
+        self.queue_selected = index;
+        self.queue_source = source.to_owned();
+        self.queue_active = true;
+        self.playing = true;
+        self.progress = 0.0;
+        self.spotify.load(track_id.clone(), ids, true, 0);
+        self.request_lyrics_for_id(track_id, true);
+    }
+
+    /// Adds a song after the current one (`next`) or to the end of the queue.
+    fn enqueue_track(&mut self, track: Track, track_id: String, next: bool) {
+        if !self.spotify_ready() {
+            return;
+        }
+        if !self.queue_active || self.queue_tracks.is_empty() {
+            self.play_list(vec![track], vec![track_id], 0, "Queue");
+            return;
+        }
+        let mut ids = (0..self.queue_tracks.len())
+            .map(|index| self.queue_spotify_ids.get(&index).cloned())
+            .collect::<Vec<_>>();
+        let position = if next {
+            (self.queue_selected + 1).min(self.queue_tracks.len())
+        } else {
+            self.queue_tracks.len()
+        };
+        if let Some(url) = &track.image_url {
+            self.request_artwork(url);
+        }
+        self.queue_tracks.insert(position, track);
+        ids.insert(position, Some(track_id.clone()));
+        self.queue_spotify_ids = ids
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, id)| id.map(|id| (index, id)))
+            .collect();
+        self.spotify.enqueue(track_id, next);
+        self.show_notice(if next { "Playing next" } else { "Added to queue" });
+    }
+
+    /// Playlists the listener can add songs to: their own and collaborative ones.
+    fn editable_playlists(&self) -> Vec<Playlist> {
+        self.playlists
+            .iter()
+            .filter(|playlist| {
+                !playlist.id.is_empty()
+                    && (playlist.collaborative
+                        || playlist.owner_id.as_deref() == Some(self.account_name.as_str()))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn show_notice(&mut self, message: &str) {
+        self.notice = Some((message.to_owned(), Instant::now()));
+    }
+
+    fn request_credits_for_current(&mut self) {
+        let Some(track_id) = self.current_track_id() else {
+            return;
+        };
+        // A failed lookup stays failed until the listener asks to try again.
+        if self.connection_state != ConnectionState::Ready || self.credits.contains_key(&track_id) {
+            return;
+        }
+        let track = self.current_track().clone();
+        self.credits.insert(track_id.clone(), CreditsState::Loading);
+        let duration_ms = track.duration_ms();
+        self.spotify
+            .load_credits(track_id, track.title, track.artist, duration_ms);
+    }
+
+    /// The actions for one song, shared by its right-click menu and the player's menu.
+    fn track_menu(&mut self, ui: &mut egui::Ui, track: &Track, track_id: Option<&str>) {
+        self.track_menu_items(ui, track, track_id, false);
+    }
+
+    /// `playing_now` leaves out the queue actions, which make no sense for the
+    /// song that is already playing.
+    fn track_menu_items(&mut self, ui: &mut egui::Ui, track: &Track, track_id: Option<&str>, playing_now: bool) {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let ready = self.connection_state == ConnectionState::Ready;
+        if let Some(track_id) = track_id.filter(|_| ready) {
+            if !playing_now && menu_item(ui, Icon::Next, "Play next", false).clicked() {
+                self.enqueue_track(track.clone(), track_id.to_owned(), true);
+                ui.close();
+            }
+            if !playing_now && menu_item(ui, Icon::Queue, "Add to queue", false).clicked() {
+                self.enqueue_track(track.clone(), track_id.to_owned(), false);
+                ui.close();
+            }
+            if menu_item(ui, Icon::Sparkle, "Start song radio", false).clicked() {
+                self.start_radio(track, track_id.to_owned());
+                ui.close();
+            }
+            let playlists = self.editable_playlists();
+            if !playlists.is_empty() {
+                submenu(ui, Icon::Note, "Add to playlist", |ui| {
+                    ui.set_min_width(200.0);
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        for playlist in playlists {
+                            if menu_item(ui, Icon::Note, &playlist.title, false).clicked() {
+                                self.spotify.add_to_playlist(
+                                    playlist.id.clone(),
+                                    playlist.title.clone(),
+                                    track_id.to_owned(),
+                                );
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+            }
+        }
+        if ready
+            && let Some(artist_id) = track.artist_id.clone()
+            && menu_item(ui, Icon::Search, "Go to artist", false).clicked()
+        {
+            let name = track.artist.split(", ").next().unwrap_or_default().to_owned();
+            self.open_artist(artist_id, name);
+            ui.close();
+        }
+        if ready
+            && let Some(album_id) = track.album_id.clone()
+            && menu_item(ui, Icon::Note, "Go to album", false).clicked()
+        {
+            self.open_album(album_id, track.album.clone(), track.artist.clone());
+            ui.close();
+        }
+        if let Some(track_id) = track_id {
+            let link = format!("https://open.spotify.com/track/{track_id}");
+            if menu_item(ui, Icon::Share, "Copy song link", false).clicked() {
+                ui.ctx().copy_text(link.clone());
+                self.show_notice("Song link copied");
+                ui.close();
+            }
+            if menu_item(ui, Icon::Share, "Open in Spotify", false).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(link));
+                ui.close();
+            }
+        }
     }
 
     fn artwork_for_index(index: usize) -> Artwork {
@@ -1829,13 +2428,16 @@ impl OynxApp {
     fn page_scrolls_itself(&self) -> bool {
         match self.section {
             Section::LikedSongs | Section::Queue | Section::Home => true,
-            Section::Library => self.playlist_name.is_some(),
+            Section::Library => self.detail.is_none() && self.playlist_name.is_some(),
             Section::Search => !self.search.trim().is_empty(),
             Section::Settings => false,
         }
     }
 
     fn open_section(&mut self, item: Section) {
+        if item != Section::Library {
+            self.detail = None;
+        }
         if item == Section::LikedSongs {
             self.open_liked_songs();
         } else {
@@ -1883,6 +2485,7 @@ impl OynxApp {
     }
 
     fn draw_page(&mut self, ui: &mut egui::Ui) {
+        self.draw_notice(ui);
         self.draw_connection_banner(ui);
         match self.section {
             Section::Home => self.draw_now_playing(ui),
@@ -2170,15 +2773,41 @@ impl OynxApp {
                 columns.album - 16.0,
             );
         }
-        painter.text(
-            egui::pos2(rect.right() - 16.0, y),
-            egui::Align2::RIGHT_CENTER,
-            &track.duration,
-            egui::FontId::proportional(13.0),
-            pal().muted,
-        );
+        // On hover the duration makes way for a "more" button with the song's actions.
+        let more_rect = egui::Rect::from_center_size(egui::pos2(rect.right() - 30.0, y), egui::vec2(30.0, 30.0));
+        let more_id = ui.id().with(("more", index));
+        let menu_open = egui::Popup::is_id_open(ui.ctx(), more_id.with("popup"));
+        if !hovered && !menu_open {
+            painter.text(
+                egui::pos2(rect.right() - 16.0, y),
+                egui::Align2::RIGHT_CENTER,
+                &track.duration,
+                egui::FontId::proportional(13.0),
+                pal().muted,
+            );
+        }
+        let track_id = self.spotify_id_for(index);
+        let mut more_clicked = false;
+        if hovered || menu_open {
+            let more = icon_button_at(ui, more_id, more_rect, Icon::Dots, 16.0, false)
+                .on_hover_text("More options");
+            more_clicked = more.clicked();
+            egui::Popup::from_toggle_button_response(&more)
+                .kind(egui::PopupKind::Menu)
+                .align(egui::RectAlign::BOTTOM_END)
+                .gap(4.0)
+                .width(220.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .frame(menu_frame())
+                .show(|ui| self.track_menu(ui, &track, track_id.as_deref()));
+        }
+        egui::Popup::context_menu(&response)
+            .width(220.0)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .frame(menu_frame())
+            .show(|ui| self.track_menu(ui, &track, track_id.as_deref()));
 
-        let mut like_clicked = false;
+        let mut like_clicked = more_clicked;
         let like_id = ui.id().with(("like", index));
         let like_scale = pop_scale(ui, like_id.with("pop"), liked, 0.35);
         let heart_alpha = if liked { 1.0 } else { hover };
@@ -2441,7 +3070,188 @@ impl OynxApp {
         }
     }
 
+    /// Square cards in a grid, such as albums or artists. Returns the clicked index.
+    fn draw_card_grid(&mut self, ui: &mut egui::Ui, cards: &[(String, String, Option<String>)]) -> Option<usize> {
+        let gap = 8.0;
+        let (columns, width) = Self::card_grid_columns(ui.available_width(), gap);
+        let mut clicked = None;
+        let indices = (0..cards.len()).collect::<Vec<_>>();
+        for row in indices.chunks(columns) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for &index in row {
+                    let (title, subtitle, image_url) = &cards[index];
+                    if self
+                        .draw_media_card(
+                            ui,
+                            width,
+                            &Self::artwork_for_index(index),
+                            image_url.as_deref(),
+                            title,
+                            subtitle,
+                            false,
+                        )
+                        .clicked()
+                    {
+                        clicked = Some(index);
+                    }
+                }
+            });
+        }
+        clicked
+    }
+
+    fn draw_detail_page(&mut self, ui: &mut egui::Ui) {
+        let Some(detail) = self.detail.clone() else {
+            return;
+        };
+        if text_icon_button(ui, Icon::ChevronLeft, "Your Library").clicked() {
+            self.detail = None;
+            return;
+        }
+        ui.add_space(12.0);
+        let song_count = |count: usize| {
+            if count == 1 { "1 song".to_owned() } else { format!("{count} songs") }
+        };
+        let (loading, error) = match &detail {
+            DetailPage::Artist { loading, error, .. }
+            | DetailPage::Album { loading, error, .. }
+            | DetailPage::Radio { loading, error, .. }
+            | DetailPage::Top { loading, error, .. } => (*loading, error.clone()),
+        };
+        let mut tracks_heading = None;
+        match &detail {
+            DetailPage::Artist { name, image_url, .. } => {
+                self.draw_collection_header(
+                    ui,
+                    Some((Self::artwork_for_index(1), image_url.clone())),
+                    "Artist",
+                    name,
+                    "Popular songs, albums and singles",
+                );
+                tracks_heading = Some("Popular");
+            }
+            DetailPage::Album {
+                name,
+                artist,
+                artist_id,
+                year,
+                image_url,
+                ..
+            } => {
+                let mut subtitle = artist.clone();
+                if let Some(year) = year {
+                    subtitle.push_str(&format!(" · {year}"));
+                }
+                if self.detail_has_tracks {
+                    subtitle.push_str(&format!(" · {}", song_count(self.tracks.len())));
+                }
+                self.draw_collection_header(
+                    ui,
+                    Some((Self::artwork_for_index(2), image_url.clone())),
+                    "Album",
+                    name,
+                    &subtitle,
+                );
+                if let Some(artist_id) = artist_id.clone()
+                    && text_link(ui, &format!("More by {}", artist.split(", ").next().unwrap_or_default()))
+                        .clicked()
+                {
+                    let name = artist.split(", ").next().unwrap_or_default().to_owned();
+                    self.open_artist(artist_id, name);
+                    return;
+                }
+                ui.add_space(8.0);
+            }
+            DetailPage::Radio {
+                title,
+                artist,
+                image_url,
+                ..
+            } => {
+                self.draw_collection_header(
+                    ui,
+                    Some((Self::artwork_for_index(3), image_url.clone())),
+                    "Song radio",
+                    &format!("{title} Radio"),
+                    &format!("Songs like {title} by {artist}, picked by Spotify"),
+                );
+            }
+            DetailPage::Top { range, artists, .. } => {
+                Self::page_title(ui, "Your top songs and artists");
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for option in TopRange::ALL {
+                        if chip(ui, option.label(), option == *range).clicked() && option != *range {
+                            self.open_top(option);
+                        }
+                    }
+                });
+                ui.add_space(24.0);
+                if !loading && !artists.is_empty() {
+                    Self::section_heading(ui, "Top artists");
+                    let cards = artists
+                        .iter()
+                        .take(12)
+                        .map(|artist| (artist.name.clone(), "Artist".to_owned(), artist.image_url.clone()))
+                        .collect::<Vec<_>>();
+                    if let Some(index) = self.draw_card_grid(ui, &cards) {
+                        let artist = artists[index].clone();
+                        self.open_artist(artist.id, artist.name);
+                        return;
+                    }
+                    ui.add_space(28.0);
+                }
+                tracks_heading = Some("Top songs");
+            }
+        }
+
+        if loading {
+            Self::muted_note(ui, "Loading…");
+            return;
+        }
+        if let Some(error) = &error {
+            Self::muted_note(ui, error);
+        }
+        if self.detail_has_tracks && !self.tracks.is_empty() {
+            if play_circle_button(ui, 52.0).on_hover_text("Play").clicked() {
+                self.play_track(0);
+            }
+            ui.add_space(16.0);
+            if let Some(heading) = tracks_heading {
+                Self::section_heading(ui, heading);
+            }
+            let indices = (0..self.tracks.len()).collect::<Vec<_>>();
+            self.draw_track_table(ui, &indices, false);
+        }
+        if let DetailPage::Artist { albums, .. } = &detail
+            && !albums.is_empty()
+        {
+            ui.add_space(32.0);
+            Self::section_heading(ui, "Albums and singles");
+            let cards = albums
+                .iter()
+                .map(|album| {
+                    let subtitle = album
+                        .year
+                        .map(|year| year.to_string())
+                        .unwrap_or_else(|| album.artist.clone());
+                    (album.name.clone(), subtitle, album.image_url.clone())
+                })
+                .collect::<Vec<_>>();
+            if let Some(index) = self.draw_card_grid(ui, &cards) {
+                let album = albums[index].clone();
+                self.open_album(album.id, album.name, album.artist);
+            }
+        }
+        ui.add_space(24.0);
+    }
+
     fn draw_library(&mut self, ui: &mut egui::Ui) {
+        if self.detail.is_some() {
+            self.draw_detail_page(ui);
+            return;
+        }
         if let Some(name) = self.playlist_name.clone() {
             self.draw_playlist_page(ui, &name);
             return;
@@ -2501,6 +3311,47 @@ impl OynxApp {
             .clicked()
         {
             self.open_liked_songs();
+        }
+
+        ui.add_space(10.0);
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 96.0),
+            egui::Sense::click(),
+        );
+        ui.painter().rect_filled(
+            rect,
+            RADIUS_LG,
+            if response.hovered() { pal().surface_hover } else { pal().surface_raised },
+        );
+        let art = egui::Rect::from_min_size(rect.min + egui::vec2(16.0, 16.0), egui::vec2(64.0, 64.0));
+        ui.painter().rect_filled(art, RADIUS_SM, pal().accent_dark);
+        paint_icon(ui.painter(), Icon::Sparkle, art.center(), 26.0, pal().accent);
+        ui.painter().text(
+            egui::pos2(art.right() + 18.0, rect.center().y - 2.0),
+            egui::Align2::LEFT_BOTTOM,
+            "Your top songs and artists",
+            font_bold(18.0),
+            pal().text,
+        );
+        ui.painter().text(
+            egui::pos2(art.right() + 18.0, rect.center().y + 3.0),
+            egui::Align2::LEFT_TOP,
+            "What you’ve played most over the last month, six months and year",
+            egui::FontId::proportional(13.0),
+            pal().muted,
+        );
+        paint_icon(
+            ui.painter(),
+            Icon::ChevronRight,
+            rect.right_center() - egui::vec2(28.0, 0.0),
+            16.0,
+            if response.hovered() { pal().text } else { pal().muted },
+        );
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.open_top(TopRange::Short);
         }
 
         ui.add_space(32.0);
@@ -2860,6 +3711,43 @@ impl OynxApp {
                 });
             });
         ui.add_space(24.0);
+    }
+
+    /// A short confirmation floating under the title bar that fades after a few seconds.
+    fn draw_notice(&mut self, ui: &mut egui::Ui) {
+        const SHOWN_FOR: f32 = 3.0;
+        let Some((message, shown_at)) = self.notice.clone() else {
+            return;
+        };
+        let age = shown_at.elapsed().as_secs_f32();
+        if age >= SHOWN_FOR {
+            self.notice = None;
+            return;
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+        let fade = ((SHOWN_FOR - age) / 0.4).clamp(0.0, 1.0);
+        egui::Area::new(egui::Id::new("oynx_notice"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, TITLE_BAR_HEIGHT + 12.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(pal().surface_raised.gamma_multiply(fade))
+                    .stroke(egui::Stroke::new(1.0, pal().border.gamma_multiply(fade)))
+                    .corner_radius(RADIUS_LG)
+                    .inner_margin(egui::Margin::symmetric(16, 9))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 4.0, pal().accent.gamma_multiply(fade));
+                            ui.label(
+                                egui::RichText::new(message)
+                                    .font(font_medium(13.0))
+                                    .color(pal().text.gamma_multiply(fade)),
+                            );
+                        });
+                    });
+            });
     }
 
     fn settings_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
@@ -3590,6 +4478,17 @@ impl OynxApp {
         }
 
         ui.add_space(16.0);
+        Self::settings_card(ui, "Lyrics", |ui| {
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for source in LyricsSource::ALL {
+                if option_row(ui, source.label(), source.detail(), self.prefs.lyrics_source == source).clicked() {
+                    self.set_lyrics_source(source);
+                }
+            }
+        });
+
+        ui.add_space(16.0);
         let tray_available = self.tray.is_some();
         Self::settings_card(ui, "When closing", |ui| {
             ui.add_space(4.0);
@@ -4022,6 +4921,49 @@ impl OynxApp {
             pal().subtle,
             2.6,
         );
+        let tabs = egui::Rect::from_min_size(
+            rect.left_top() + egui::vec2(132.0, -2.0),
+            egui::vec2((rect.width() - 132.0).max(160.0), 30.0),
+        );
+        let mut tabs_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(tabs)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        tabs_ui.spacing_mut().item_spacing.x = 6.0;
+        for (tab, label) in [(NowPlayingTab::Lyrics, "Lyrics"), (NowPlayingTab::Credits, "Credits")] {
+            if chip(&mut tabs_ui, label, self.now_playing_tab == tab).clicked() {
+                self.now_playing_tab = tab;
+            }
+        }
+        if self.now_playing_tab == NowPlayingTab::Lyrics {
+            // Where the lyrics came from, and a menu to pick another source.
+            tabs_ui.add_space(6.0);
+            let label = match (&self.lyrics_provider, self.prefs.lyrics_source) {
+                (Some(provider), _) => format!("From {provider}"),
+                (None, LyricsSource::Auto) => "Choose lyrics source".to_owned(),
+                (None, source) => format!("From {}", source.label()),
+            };
+            let source_button = text_link(&mut tabs_ui, &label).on_hover_text("Choose where lyrics come from");
+            egui::Popup::from_toggle_button_response(&source_button)
+                .kind(egui::PopupKind::Menu)
+                .align(egui::RectAlign::BOTTOM_START)
+                .gap(4.0)
+                .width(230.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                .frame(menu_frame())
+                .show(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for source in LyricsSource::ALL {
+                        if menu_item(ui, Icon::Note, source.label(), self.prefs.lyrics_source == source)
+                            .on_hover_text(source.detail())
+                            .clicked()
+                        {
+                            self.set_lyrics_source(source);
+                        }
+                    }
+                });
+        }
         let show_visualizer = rect.width() >= 520.0;
         let visualizer_x = rect.left() + (rect.width() * 0.76).min(rect.width() - 110.0);
         let lyrics_rect = egui::Rect::from_min_max(
@@ -4035,7 +4977,10 @@ impl OynxApp {
                 rect.bottom(),
             ),
         );
-        self.draw_lyrics(ui, lyrics_rect);
+        match self.now_playing_tab {
+            NowPlayingTab::Lyrics => self.draw_lyrics(ui, lyrics_rect),
+            NowPlayingTab::Credits => self.draw_credits(ui, lyrics_rect),
+        }
         if show_visualizer {
             self.paint_visualizer(
                 ui,
@@ -4044,6 +4989,112 @@ impl OynxApp {
                     egui::pos2(rect.right(), rect.bottom() - 6.0),
                 ),
             );
+        }
+    }
+
+    /// Who made the current song and how it connects to others: Oynx's take on
+    /// Spotify's SongDNA, from Spotify's metadata and MusicBrainz.
+    fn draw_credits(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        self.request_credits_for_current();
+        let track = self.current_track().clone();
+        let track_id = self.current_track_id();
+        let mut panel = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        let ui = &mut panel;
+        let mut search = None;
+        let mut retry = false;
+        egui::ScrollArea::vertical()
+            .id_salt("credits")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width() - 12.0);
+                ui.add(egui::Label::new(
+                    egui::RichText::new(&track.title).font(font_light(30.0)).color(pal().text),
+                ));
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(
+                    egui::RichText::new(&track.artist).font(font_light(21.0)).color(pal().muted),
+                ));
+                ui.add_space(26.0);
+                let state = track_id.as_ref().and_then(|id| self.credits.get(id));
+                match state {
+                    None => Self::muted_note(
+                        ui,
+                        if self.connection_state == ConnectionState::Ready {
+                            "Play a song to see who made it."
+                        } else {
+                            "Sign in to Spotify to see song credits."
+                        },
+                    ),
+                    Some(CreditsState::Loading) => Self::muted_note(ui, "Finding who made this song…"),
+                    Some(CreditsState::Failed(error)) => {
+                        Self::muted_note(ui, error);
+                        ui.add_space(6.0);
+                        retry = pill_button(ui, "Try again", ButtonKind::Ghost).clicked();
+                    }
+                    Some(CreditsState::Ready(credits)) => {
+                        let credits = credits.clone();
+                        if credits.is_empty() {
+                            Self::muted_note(ui, "MusicBrainz has no credits for this song yet.");
+                        }
+                        for group in &credits.credits {
+                            credits_heading(ui, &group.role);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(18.0, 6.0);
+                                for name in &group.names {
+                                    if credit_link(ui, name, 17.0, pal().text)
+                                        .on_hover_text("Search Spotify")
+                                        .clicked()
+                                    {
+                                        // Instrument and vocal credits read "Name (guitar)".
+                                        let name = name.split(" (").next().unwrap_or(name);
+                                        search = Some(name.to_owned());
+                                    }
+                                }
+                            });
+                            ui.add_space(18.0);
+                        }
+                        for (heading, links) in [
+                            ("Samples", &credits.samples),
+                            ("Sampled in", &credits.sampled_by),
+                            ("Other versions", &credits.versions),
+                        ] {
+                            if links.is_empty() {
+                                continue;
+                            }
+                            credits_heading(ui, heading);
+                            for link in links {
+                                if song_link_row(ui, link).clicked() {
+                                    search = Some(format!("{} {}", link.title, link.artist));
+                                }
+                            }
+                            ui.add_space(18.0);
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Credits come from Spotify and MusicBrainz, the open music encyclopedia anyone can edit.",
+                            )
+                            .size(12.0)
+                            .color(pal().subtle),
+                        );
+                        if let Some(url) = &credits.source_url
+                            && text_link(ui, "View on MusicBrainz").clicked()
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        }
+                        ui.add_space(24.0);
+                    }
+                }
+            });
+        if retry && let Some(track_id) = track_id {
+            self.credits.remove(&track_id);
+        }
+        if let Some(query) = search {
+            self.search_for(&query);
         }
     }
 
@@ -4330,18 +5381,61 @@ impl OynxApp {
                 ui.spacing_mut().item_spacing.y = 4.0;
                 match self.right_panel_tab {
                     RightPanelTab::Queue => self.draw_up_next(ui),
-                    RightPanelTab::Recent => {
-                        let recent = (0..self.tracks.len()).rev().take(20).collect::<Vec<_>>();
-                        for index in recent {
-                            let track = self.tracks[index].clone();
-                            let current = self.is_current_track(index);
-                            if self.draw_queue_row(ui, &track, current).clicked() {
-                                self.play_track(index);
-                            }
-                        }
-                    }
+                    RightPanelTab::Recent => self.draw_recently_played(ui),
                 }
             });
+    }
+
+    /// Songs Spotify says this account played recently, newest first.
+    fn draw_recently_played(&mut self, ui: &mut egui::Ui) {
+        let ready = self.connection_state == ConnectionState::Ready;
+        let stale = self
+            .recent_loaded_at
+            .is_none_or(|loaded| loaded.elapsed() >= Duration::from_secs(60));
+        if ready && stale && !self.recent_loading {
+            self.recent_loading = true;
+            self.recent_loaded_at = Some(Instant::now());
+            self.spotify.load_recently_played();
+        }
+        if !ready {
+            Self::muted_note(ui, "Sign in to see what you played recently.");
+            return;
+        }
+        if let Some(error) = self.recent_error.clone() {
+            Self::muted_note(ui, &error);
+            return;
+        }
+        if self.recent_tracks.is_empty() {
+            Self::muted_note(
+                ui,
+                if self.recent_loading {
+                    "Loading your recently played songs…"
+                } else {
+                    "Nothing played recently"
+                },
+            );
+            return;
+        }
+        let current_id = self.current_track_id();
+        for index in 0..self.recent_tracks.len() {
+            let track = self.recent_tracks[index].clone();
+            let track_id = self.recent_ids.get(index).cloned();
+            let current = self.queue_active && track_id.is_some() && track_id == current_id;
+            let response = self.draw_queue_row(ui, &track, current);
+            if response.clicked() {
+                self.play_list(
+                    self.recent_tracks.clone(),
+                    self.recent_ids.clone(),
+                    index,
+                    "Recently played",
+                );
+            }
+            egui::Popup::context_menu(&response)
+                .width(220.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .frame(menu_frame())
+                .show(|ui| self.track_menu(ui, &track, track_id.as_deref()));
+        }
     }
 
     fn draw_up_next(&mut self, ui: &mut egui::Ui) {
@@ -4360,9 +5454,20 @@ impl OynxApp {
             let Some(track) = self.queue_track(index) else {
                 continue;
             };
-            if self.draw_queue_row(ui, &track, index == current_index).clicked() {
+            let response = self.draw_queue_row(ui, &track, index == current_index);
+            if response.clicked() {
                 self.play_queue_track(index);
             }
+            let track_id = if self.queue_active && !self.queue_tracks.is_empty() {
+                self.queue_spotify_ids.get(&index).cloned()
+            } else {
+                self.spotify_id_for(index)
+            };
+            egui::Popup::context_menu(&response)
+                .width(220.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .frame(menu_frame())
+                .show(|ui| self.track_menu(ui, &track, track_id.as_deref()));
         }
         if end < queue_len || self.queue_expanded {
             ui.add_space(4.0);
@@ -4533,12 +5638,19 @@ impl OynxApp {
             .align(egui::RectAlign::TOP_START)
             .gap(6.0)
             .width(220.0)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .frame(menu_frame())
             .show(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 if menu_item(ui, Icon::NowPlaying, "Now playing", self.section == Section::Home).clicked() {
+                    self.now_playing_tab = NowPlayingTab::Lyrics;
                     self.open_section(Section::Home);
+                    ui.close();
+                }
+                if menu_item(ui, Icon::Waveform, "Song credits", false).clicked() {
+                    self.now_playing_tab = NowPlayingTab::Credits;
+                    self.open_section(Section::Home);
+                    ui.close();
                 }
                 if menu_item(ui, Icon::Queue, "Show queue", false).clicked() {
                     self.right_panel_tab = RightPanelTab::Queue;
@@ -4547,14 +5659,53 @@ impl OynxApp {
                     } else {
                         self.toggle_queue_view(false);
                     }
+                    ui.close();
                 }
-                if let Some(track_id) = &track_id
-                    && menu_item(ui, Icon::Share, "Open in Spotify", false).clicked()
-                {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!(
-                        "https://open.spotify.com/track/{track_id}"
-                    )));
-                }
+                self.track_menu_items(ui, &track, track_id.as_deref(), true);
+                let label = match self.sleep_timer {
+                    None => "Sleep timer".to_owned(),
+                    Some(SleepTimer::EndOfTrack) => "Sleep timer · end of song".to_owned(),
+                    Some(SleepTimer::At(at)) => {
+                        let minutes = at.saturating_duration_since(Instant::now()).as_secs().div_ceil(60);
+                        format!("Sleep timer · {minutes} min")
+                    }
+                };
+                submenu(ui, Icon::Clock, &label, |ui| {
+                    ui.set_min_width(180.0);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let mut choice = None;
+                    for minutes in [5u64, 15, 30, 45, 60, 90] {
+                        if menu_item(ui, Icon::Clock, &format!("{minutes} minutes"), false).clicked() {
+                            choice = Some(Some(SleepTimer::At(
+                                Instant::now() + Duration::from_secs(minutes * 60),
+                            )));
+                        }
+                    }
+                    if menu_item(
+                        ui,
+                        Icon::Clock,
+                        "End of this song",
+                        self.sleep_timer == Some(SleepTimer::EndOfTrack),
+                    )
+                    .clicked()
+                    {
+                        choice = Some(Some(SleepTimer::EndOfTrack));
+                    }
+                    if self.sleep_timer.is_some()
+                        && menu_item(ui, Icon::Close, "Turn off", false).clicked()
+                    {
+                        choice = Some(None);
+                    }
+                    if let Some(timer) = choice {
+                        self.sleep_timer = timer;
+                        self.show_notice(match timer {
+                            Some(SleepTimer::At(_)) => "Sleep timer set",
+                            Some(SleepTimer::EndOfTrack) => "Playback will pause after this song",
+                            None => "Sleep timer off",
+                        });
+                        ui.close();
+                    }
+                });
             });
 
         // Progress
@@ -5028,7 +6179,13 @@ impl OynxApp {
             .map(|shown| shown.response.rect);
 
         // Fade and lift the page in whenever the user navigates somewhere new.
-        let page_key = (self.section, self.playlist_name.clone());
+        let page_key = (
+            self.section,
+            self.detail
+                .as_ref()
+                .map(DetailPage::key)
+                .or_else(|| self.playlist_name.clone()),
+        );
         if page_key != self.page_key {
             self.page_key = page_key;
             self.page_entered = Instant::now();
@@ -5168,6 +6325,19 @@ impl OynxApp {
     /// window is hidden in the tray (playback auto-advance depends on it).
     fn tick(&mut self, ctx: &egui::Context) {
         let events_changed = self.poll_spotify(ctx);
+        if let Some(SleepTimer::At(at)) = self.sleep_timer {
+            let now = Instant::now();
+            if now >= at {
+                self.sleep_timer = None;
+                if self.playing {
+                    self.toggle_playback();
+                }
+                self.save_session();
+                self.show_notice("Sleep timer paused playback");
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
         if self.queue_active && self.last_session_save.elapsed() >= Duration::from_secs(5) {
             self.save_session();
             self.last_session_save = Instant::now();
@@ -5558,6 +6728,71 @@ fn text_link(ui: &mut egui::Ui, text: &str) -> egui::Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+fn credits_heading(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+    paint_text_spaced(
+        ui.painter(),
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        &text.to_uppercase(),
+        egui::FontId::proportional(10.5),
+        pal().subtle,
+        2.0,
+    );
+    ui.add_space(6.0);
+}
+
+/// A name in the song credits that runs a search when clicked.
+fn credit_link(ui: &mut egui::Ui, text: &str, size: f32, color: egui::Color32) -> egui::Response {
+    let font = font_light(size);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), color);
+    let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::click());
+    let hover = hover_t(ui, &response);
+    ui.painter()
+        .text(rect.left_center(), egui::Align2::LEFT_CENTER, text, font, mix(color, pal().accent, hover));
+    if hover > 0.0 {
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom(),
+            egui::Stroke::new(1.0, pal().accent.gamma_multiply(hover)),
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn song_link_row(ui: &mut egui::Ui, link: &SongLink) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
+    let hover = hover_t(ui, &response);
+    if hover > 0.0 {
+        ui.painter()
+            .rect_filled(rect, RADIUS_SM, pal().surface_raised.gamma_multiply(hover));
+    }
+    paint_icon(ui.painter(), Icon::Note, rect.left_center() + egui::vec2(16.0, 0.0), 15.0, pal().muted);
+    let title = paint_text(
+        ui.painter(),
+        rect.left_center() + egui::vec2(36.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        &link.title,
+        font_medium(14.0),
+        mix(pal().text, pal().accent, hover),
+        (rect.width() - 48.0) * 0.6,
+    );
+    if !link.artist.is_empty() {
+        paint_text(
+            ui.painter(),
+            egui::pos2(title.right() + 10.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &link.artist,
+            egui::FontId::proportional(13.0),
+            pal().muted,
+            rect.right() - title.right() - 20.0,
+        );
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Search Spotify")
+}
+
 fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let font = font_medium(12.0);
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), pal().text);
@@ -5646,6 +6881,19 @@ fn menu_item(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool) -> egui:
         if hovered || selected { pal().text } else { pal().muted },
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A menu row that opens a submenu to the side when hovered.
+fn submenu(ui: &mut egui::Ui, icon: Icon, text: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let response = menu_item(ui, icon, text, false);
+    paint_icon(
+        ui.painter(),
+        Icon::ChevronRight,
+        response.rect.right_center() - egui::vec2(16.0, 0.0),
+        12.0,
+        pal().muted,
+    );
+    egui::containers::menu::SubMenu::new().show(ui, &response, add_contents);
 }
 
 /// Paints a texture clipped to a circle and rotated clockwise by `angle` radians.
@@ -6117,6 +7365,8 @@ mod tests {
                 album: "An album".to_owned(),
                 duration_ms: 180_000,
                 image_url: None,
+                artist_id: Some("artist-id".to_owned()),
+                album_id: None,
             }],
         };
         let encoded = serde_json::to_string(&session).expect("session should serialize");
