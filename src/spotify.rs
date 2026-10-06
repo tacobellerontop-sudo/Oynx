@@ -14,6 +14,10 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use librespot::{
+    metadata::{
+        Album as AlbumMetadata, Artist as ArtistMetadata, Metadata,
+        Track as TrackMetadata, artist::ArtistRole,
+    },
     core::{
         SpotifyUri, authentication::Credentials, cache::Cache, config::SessionConfig,
         session::Session, spotify_id::SpotifyId,
@@ -28,7 +32,10 @@ use librespot::{
 };
 use tokio::sync::{Mutex as TokioMutex, Semaphore, mpsc as tokio_mpsc};
 
-use crate::audio::AudioTaps;
+use crate::{
+    audio::AudioTaps,
+    credits::{self, CreditsQuery, SongCredits},
+};
 
 const DEFAULT_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8898/login";
@@ -41,16 +48,33 @@ const WEB_API_SCOPES: &[&str] = &[
     "playlist-read-collaborative",
     "user-top-read",
 ];
+/// Permissions newer features use. They are requested at sign-in but not
+/// required to restore a saved sign-in, so existing users are not signed out;
+/// those features explain how to grant them when Spotify refuses a request.
+const OPTIONAL_WEB_API_SCOPES: &[&str] = &[
+    "user-read-recently-played",
+    "playlist-modify-public",
+    "playlist-modify-private",
+];
+const MISSING_PERMISSION: &str = "Spotify needs a newer permission for this. Sign out from Settings and sign in again, then try once more.";
 const AUDIO_CACHE_LIMIT: u64 = 1_000_000_000;
 const MAX_ARTWORK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_API_PAGES: usize = 100;
 const MAX_LIKED_SONG_PAGES: usize = MAX_API_PAGES;
 
+fn requested_web_api_scopes() -> Vec<&'static str> {
+    WEB_API_SCOPES
+        .iter()
+        .chain(OPTIONAL_WEB_API_SCOPES)
+        .copied()
+        .collect()
+}
+
 fn combined_oauth_scopes() -> Vec<&'static str> {
     STREAMING_SCOPES
         .iter()
         .copied()
-        .chain(WEB_API_SCOPES.iter().copied())
+        .chain(requested_web_api_scopes())
         .collect()
 }
 
@@ -213,6 +237,8 @@ fn should_cache(url: &str) -> bool {
         || url.contains("/me/tracks")
         || url.contains("/recommendations")
         || url.contains("/playlists/")
+        || url.contains("/albums/")
+        || url.contains("/artists/")
 }
 
 fn read_cached_json<T: DeserializeOwned>(key: &str, max_age: Option<Duration>) -> Option<T> {
@@ -351,9 +377,9 @@ async fn load_saved_token(client_id: &str, redirect_uri: &str) -> Option<OAuthTo
         client_id.to_owned(),
         redirect_uri.to_owned(),
         stored.refresh_token,
-        WEB_API_SCOPES
-            .iter()
-            .map(|scope| (*scope).to_owned())
+        requested_web_api_scopes()
+            .into_iter()
+            .map(str::to_owned)
             .collect(),
     )
     .await
@@ -614,6 +640,62 @@ impl WebApiClient {
         Err("Spotify library update rate limit retry failed.".to_owned())
     }
 
+    /// Sends a JSON body to a Web API endpoint that changes something, such as
+    /// adding a song to a playlist, and clears the response cache afterwards.
+    async fn send_json(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), String> {
+        let mut access_token = self.access_token().await?;
+        let mut refreshed = false;
+        for attempt in 0..3 {
+            let response = self
+                .http
+                .request(method.clone(), url)
+                .bearer_auth(access_token.clone())
+                .json(body)
+                .send()
+                .await
+                .map_err(|error| format!("Spotify request failed: {error}"))?;
+            let status = response.status();
+            if status.is_success() {
+                let _ = std::fs::remove_dir_all(web_api_cache_path());
+                return Ok(());
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                refreshed = true;
+                self.expire_token().await;
+                access_token = self.access_token().await?;
+                continue;
+            }
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < 2 {
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(1);
+                if retry_after <= 5 {
+                    tokio::time::sleep(Duration::from_secs(retry_after + 1)).await;
+                    continue;
+                }
+            }
+            if status == reqwest::StatusCode::FORBIDDEN {
+                return Err(MISSING_PERMISSION.to_owned());
+            }
+            let detail = response.text().await.unwrap_or_default();
+            let detail = detail.trim().chars().take(300).collect::<String>();
+            return Err(if detail.is_empty() {
+                format!("Spotify returned HTTP {status}.")
+            } else {
+                format!("Spotify returned HTTP {status}: {detail}")
+            });
+        }
+        Err("Spotify rate limit retry failed.".to_owned())
+    }
+
     async fn fetch_artwork(&self, url: &str) -> Result<DecodedArtwork, String> {
         let key = web_api_cache_key("artwork", url, &[]);
         let path = artwork_cache_path().join(key);
@@ -762,6 +844,9 @@ pub struct SpotifyTrack {
     pub album: String,
     pub duration_ms: u32,
     pub image_url: Option<String>,
+    /// The first credited artist, for "Go to artist".
+    pub artist_id: Option<String>,
+    pub album_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -771,7 +856,53 @@ pub struct SpotifyPlaylist {
     pub description: String,
     pub track_count: u32,
     pub owner: String,
+    pub owner_id: Option<String>,
+    pub collaborative: bool,
     pub image_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpotifyArtist {
+    pub id: String,
+    pub name: String,
+    pub image_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpotifyAlbum {
+    pub id: String,
+    pub name: String,
+    pub artist: String,
+    pub year: Option<i32>,
+    pub image_url: Option<String>,
+}
+
+/// The period Spotify's top tracks and artists cover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopRange {
+    Short,
+    Medium,
+    Long,
+}
+
+impl TopRange {
+    pub const ALL: [Self; 3] = [Self::Short, Self::Medium, Self::Long];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Short => "Last 4 weeks",
+            Self::Medium => "Last 6 months",
+            Self::Long => "Last year",
+        }
+    }
+
+    fn api_value(self) -> &'static str {
+        match self {
+            Self::Short => "short_term",
+            Self::Medium => "medium_term",
+            Self::Long => "long_term",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -833,6 +964,45 @@ pub enum PlaybackEvent {
     ArtworkError {
         url: String,
     },
+    ArtistPage {
+        artist_id: String,
+        name: String,
+        image_url: Option<String>,
+        tracks: Vec<SpotifyTrack>,
+        albums: Vec<SpotifyAlbum>,
+        error: Option<String>,
+    },
+    AlbumPage {
+        album_id: String,
+        name: String,
+        artist: String,
+        artist_id: Option<String>,
+        year: Option<i32>,
+        image_url: Option<String>,
+        tracks: Vec<SpotifyTrack>,
+        error: Option<String>,
+    },
+    RecentlyPlayed {
+        tracks: Vec<SpotifyTrack>,
+        error: Option<String>,
+    },
+    TopItems {
+        range: TopRange,
+        tracks: Vec<SpotifyTrack>,
+        artists: Vec<SpotifyArtist>,
+        error: Option<String>,
+    },
+    Credits {
+        track_id: String,
+        result: Result<SongCredits, String>,
+    },
+    Radio {
+        seed_track_id: String,
+        tracks: Vec<SpotifyTrack>,
+        error: Option<String>,
+    },
+    /// A short confirmation to show the listener, such as "Added to a playlist".
+    Notice(String),
     Ended,
     Error(String),
 }
@@ -884,10 +1054,39 @@ enum PlaybackCommand {
         playlist_id: String,
     },
     LoadLikedSongs,
+    LoadArtist {
+        artist_id: String,
+        name: String,
+    },
+    LoadAlbum {
+        album_id: String,
+    },
+    LoadRecentlyPlayed,
+    LoadTop(TopRange),
+    LoadCredits {
+        track_id: String,
+        title: String,
+        artist: String,
+        duration_ms: u32,
+    },
+    StartRadio {
+        track_id: String,
+    },
+    Enqueue {
+        track_id: String,
+        next: bool,
+    },
+    AddToPlaylist {
+        playlist_id: String,
+        playlist_name: String,
+        track_id: String,
+    },
     Shutdown,
 }
 
 struct ConnectedPlayer {
+    /// Spotify's own metadata and radio services, which the Web API lacks.
+    session: Session,
     player: std::sync::Arc<Player>,
     web_api: Arc<WebApiClient>,
     mixer: std::sync::Arc<dyn Mixer>,
@@ -1038,6 +1237,52 @@ impl SpotifyClient {
 
     pub fn load_liked_songs(&self) {
         let _ = self.command_tx.send(PlaybackCommand::LoadLikedSongs);
+    }
+
+    pub fn load_artist(&self, artist_id: String, name: String) {
+        let _ = self
+            .command_tx
+            .send(PlaybackCommand::LoadArtist { artist_id, name });
+    }
+
+    pub fn load_album(&self, album_id: String) {
+        let _ = self.command_tx.send(PlaybackCommand::LoadAlbum { album_id });
+    }
+
+    pub fn load_recently_played(&self) {
+        let _ = self.command_tx.send(PlaybackCommand::LoadRecentlyPlayed);
+    }
+
+    pub fn load_top(&self, range: TopRange) {
+        let _ = self.command_tx.send(PlaybackCommand::LoadTop(range));
+    }
+
+    pub fn load_credits(&self, track_id: String, title: String, artist: String, duration_ms: u32) {
+        let _ = self.command_tx.send(PlaybackCommand::LoadCredits {
+            track_id,
+            title,
+            artist,
+            duration_ms,
+        });
+    }
+
+    pub fn start_radio(&self, track_id: String) {
+        let _ = self.command_tx.send(PlaybackCommand::StartRadio { track_id });
+    }
+
+    /// Adds a track after the current one (`next`) or at the end of the queue.
+    pub fn enqueue(&self, track_id: String, next: bool) {
+        let _ = self
+            .command_tx
+            .send(PlaybackCommand::Enqueue { track_id, next });
+    }
+
+    pub fn add_to_playlist(&self, playlist_id: String, playlist_name: String, track_id: String) {
+        let _ = self.command_tx.send(PlaybackCommand::AddToPlaylist {
+            playlist_id,
+            playlist_name,
+            track_id,
+        });
     }
 
     pub fn poll(&self) -> Option<PlaybackEvent> {
@@ -1424,6 +1669,147 @@ fn run_worker(
                         );
                     }
                 }
+                PlaybackCommand::LoadArtist { artist_id, name } => {
+                    if let Some(player) = connected.as_ref() {
+                        let session = player.session.clone();
+                        spawn_api_job(
+                            player.web_api.clone(),
+                            events.clone(),
+                            api_permits.clone(),
+                            move |api, events| async move {
+                                load_artist(&api, &session, &artist_id, &name, &events).await;
+                            },
+                        );
+                    }
+                }
+                PlaybackCommand::LoadAlbum { album_id } => {
+                    if let Some(player) = connected.as_ref() {
+                        spawn_api_job(
+                            player.web_api.clone(),
+                            events.clone(),
+                            api_permits.clone(),
+                            move |api, events| async move {
+                                load_album(&api, &album_id, &events).await;
+                            },
+                        );
+                    }
+                }
+                PlaybackCommand::LoadRecentlyPlayed => {
+                    if let Some(player) = connected.as_ref() {
+                        spawn_api_job(
+                            player.web_api.clone(),
+                            events.clone(),
+                            api_permits.clone(),
+                            |api, events| async move {
+                                load_recently_played(&api, &events).await;
+                            },
+                        );
+                    }
+                }
+                PlaybackCommand::LoadTop(range) => {
+                    if let Some(player) = connected.as_ref() {
+                        spawn_api_job(
+                            player.web_api.clone(),
+                            events.clone(),
+                            api_permits.clone(),
+                            move |api, events| async move {
+                                load_top(&api, range, &events).await;
+                            },
+                        );
+                    }
+                }
+                PlaybackCommand::LoadCredits {
+                    track_id,
+                    title,
+                    artist,
+                    duration_ms,
+                } => {
+                    if let Some(player) = connected.as_ref() {
+                        let session = player.session.clone();
+                        // MusicBrainz is slow and rate limited, so credits do not
+                        // take one of the Web API permits.
+                        let events = events.clone();
+                        tokio::spawn(async move {
+                            let mut query = CreditsQuery {
+                                title,
+                                artist,
+                                duration_ms,
+                                ..CreditsQuery::default()
+                            };
+                            if let Some(metadata) = track_metadata(&session, &track_id).await {
+                                query.isrc = metadata
+                                    .external_ids
+                                    .iter()
+                                    .find(|id| id.external_type.eq_ignore_ascii_case("isrc"))
+                                    .map(|id| id.id.clone());
+                                query.spotify_credits = metadata
+                                    .artists_with_role
+                                    .iter()
+                                    .filter_map(|artist| {
+                                        spotify_role_label(artist.role)
+                                            .map(|role| (role.to_owned(), artist.name.clone()))
+                                    })
+                                    .collect();
+                            }
+                            let result = credits::lookup(&query).await;
+                            let _ = events.send(PlaybackEvent::Credits { track_id, result });
+                        });
+                    }
+                }
+                PlaybackCommand::StartRadio { track_id } => {
+                    if let Some(player) = connected.as_ref() {
+                        let session = player.session.clone();
+                        let events = events.clone();
+                        tokio::spawn(async move {
+                            let (tracks, error) = match song_radio(&session, &track_id).await {
+                                Ok(tracks) if !tracks.is_empty() => (tracks, None),
+                                Ok(_) => (
+                                    Vec::new(),
+                                    Some("Spotify has no radio for this song yet.".to_owned()),
+                                ),
+                                Err(error) => (Vec::new(), Some(error)),
+                            };
+                            let _ = events.send(PlaybackEvent::Radio {
+                                seed_track_id: track_id,
+                                tracks,
+                                error,
+                            });
+                        });
+                    }
+                }
+                PlaybackCommand::Enqueue { track_id, next } => {
+                    if let Some(player) = connected.as_mut() {
+                        enqueue(player, track_id, next, &events);
+                    }
+                }
+                PlaybackCommand::AddToPlaylist {
+                    playlist_id,
+                    playlist_name,
+                    track_id,
+                } => {
+                    if let Some(player) = connected.as_ref() {
+                        spawn_api_job(
+                            player.web_api.clone(),
+                            events.clone(),
+                            api_permits.clone(),
+                            move |api, events| async move {
+                                let url = format!(
+                                    "https://api.spotify.com/v1/playlists/{playlist_id}/items"
+                                );
+                                let body = serde_json::json!({
+                                    "uris": [format!("spotify:track:{track_id}")]
+                                });
+                                let event = match api.send_json(reqwest::Method::POST, &url, &body).await {
+                                    Ok(()) => PlaybackEvent::Notice(format!("Added to {playlist_name}")),
+                                    Err(error) => PlaybackEvent::Error(format!(
+                                        "Could not add the song to {playlist_name}: {error}"
+                                    )),
+                                };
+                                let _ = events.send(event);
+                            },
+                        );
+                    }
+                }
                 PlaybackCommand::Shutdown => break,
             }
         }
@@ -1537,7 +1923,7 @@ async fn oauth_credentials(
             let web_token = authorize_token(
                 &web_api_client_id,
                 &web_api_redirect_uri,
-                WEB_API_SCOPES,
+                &requested_web_api_scopes(),
                 "<html><body style='font-family:sans-serif;padding:40px'><h2>Oynx Web API is connected.</h2><p>You can close this tab and return to Oynx.</p></body></html>",
             )?;
             (streaming_token, web_token)
@@ -1601,9 +1987,9 @@ async fn connect(
         web_api_client_id.to_owned(),
         web_api_redirect_uri.to_owned(),
         format!("{web_api_client_id}:{username}"),
-        WEB_API_SCOPES
-            .iter()
-            .map(|scope| (*scope).to_owned())
+        requested_web_api_scopes()
+            .into_iter()
+            .map(str::to_owned)
             .collect(),
         web_token,
     ));
@@ -1613,7 +1999,7 @@ async fn connect(
         ..PlayerConfig::default()
     };
     let audio = audio.clone();
-    let player = Player::new(player_config, session, mixer.get_soft_volume(), move || {
+    let player = Player::new(player_config, session.clone(), mixer.get_soft_volume(), move || {
         audio.wrap_sink(sink_builder(None, audio_format), librespot::playback::SAMPLE_RATE as f32)
     });
 
@@ -1627,6 +2013,7 @@ async fn connect(
 
     let _ = events.send(PlaybackEvent::Ready { username });
     Ok(ConnectedPlayer {
+        session,
         player,
         web_api,
         mixer,
@@ -1659,14 +2046,48 @@ struct SearchTrack {
 
 #[derive(Clone, Debug, Deserialize)]
 struct SearchArtist {
+    #[serde(default)]
+    id: Option<String>,
     name: String,
+    #[serde(default)]
+    images: Vec<ApiImage>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct SearchAlbum {
+    #[serde(default)]
+    id: Option<String>,
     name: String,
     #[serde(default)]
     images: Vec<ApiImage>,
+    #[serde(default)]
+    artists: Vec<SearchArtist>,
+    #[serde(default)]
+    release_date: Option<String>,
+}
+
+impl SearchAlbum {
+    fn into_album(self) -> Option<SpotifyAlbum> {
+        Some(SpotifyAlbum {
+            id: self.id?,
+            year: self
+                .release_date
+                .as_deref()
+                .and_then(|date| date.get(..4))
+                .and_then(|year| year.parse().ok()),
+            image_url: select_image(&self.images),
+            artist: join_artists(&self.artists),
+            name: self.name,
+        })
+    }
+}
+
+fn join_artists(artists: &[SearchArtist]) -> String {
+    artists
+        .iter()
+        .map(|artist| artist.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1727,6 +2148,8 @@ struct ApiPlaylist {
     #[serde(default)]
     owner: Option<ApiPlaylistOwner>,
     #[serde(default)]
+    collaborative: bool,
+    #[serde(default)]
     images: Vec<ApiImage>,
 }
 
@@ -1744,6 +2167,8 @@ struct ApiPlaylistItems {
 
 #[derive(Debug, Deserialize)]
 struct ApiPlaylistOwner {
+    #[serde(default)]
+    id: Option<String>,
     display_name: Option<String>,
 }
 
@@ -1851,13 +2276,10 @@ fn map_search_track(track: SearchTrack) -> SpotifyTrack {
     SpotifyTrack {
         id: track.id,
         title: track.name,
-        artist: track
-            .artists
-            .into_iter()
-            .map(|artist| artist.name)
-            .collect::<Vec<_>>()
-            .join(", "),
+        artist: join_artists(&track.artists),
+        artist_id: track.artists.first().and_then(|artist| artist.id.clone()),
         album: track.album.name,
+        album_id: track.album.id,
         duration_ms: track.duration_ms,
         image_url: select_image(&track.album.images),
     }
@@ -2106,6 +2528,7 @@ async fn load_playlists(client: &WebApiClient, events: &Sender<PlaybackEvent>) {
         .filter_map(|value| serde_json::from_value::<ApiPlaylist>(value).ok())
         .map(|playlist| {
             let track_count = playlist.track_count();
+            let owner_id = playlist.owner.as_ref().and_then(|owner| owner.id.clone());
             let owner = playlist
                 .owner
                 .and_then(|owner| owner.display_name)
@@ -2122,6 +2545,8 @@ async fn load_playlists(client: &WebApiClient, events: &Sender<PlaybackEvent>) {
                 description,
                 track_count,
                 owner,
+                owner_id,
+                collaborative: playlist.collaborative,
                 image_url: select_image(&playlist.images),
             }
         })
@@ -2239,6 +2664,552 @@ async fn load_liked_songs(client: &WebApiClient, events: &Sender<PlaybackEvent>)
     let _ = events.send(PlaybackEvent::LikedSongs { tracks });
     if let Some(message) = error_message {
         let _ = events.send(PlaybackEvent::LikedSongsError { message });
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumSearchResponse {
+    albums: AlbumPage,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumPage {
+    #[serde(default)]
+    items: Vec<SearchAlbum>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumResponse {
+    id: String,
+    name: String,
+    #[serde(default)]
+    artists: Vec<SearchArtist>,
+    #[serde(default)]
+    images: Vec<ApiImage>,
+    #[serde(default)]
+    release_date: Option<String>,
+    tracks: AlbumTrackPage,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumTrackPage {
+    #[serde(default)]
+    items: Vec<AlbumTrack>,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AlbumTrack {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    duration_ms: u32,
+    #[serde(default)]
+    artists: Vec<SearchArtist>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentlyPlayedResponse {
+    #[serde(default)]
+    items: Vec<SavedTrackItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopArtistItems {
+    #[serde(default)]
+    items: Vec<SearchArtist>,
+}
+
+fn album_tracks_from_response(album: AlbumResponse, extra: Vec<AlbumTrack>) -> (SpotifyAlbum, Vec<SpotifyTrack>) {
+    let image_url = select_image(&album.images);
+    let album_id = album.id.clone();
+    let album_name = album.name.clone();
+    let tracks = album
+        .tracks
+        .items
+        .into_iter()
+        .chain(extra)
+        .filter_map(|track| {
+            Some(SpotifyTrack {
+                id: track.id?,
+                title: track.name,
+                artist: join_artists(&track.artists),
+                artist_id: track.artists.first().and_then(|artist| artist.id.clone()),
+                album: album_name.clone(),
+                album_id: Some(album_id.clone()),
+                duration_ms: track.duration_ms,
+                image_url: image_url.clone(),
+            })
+        })
+        .collect();
+    let summary = SearchAlbum {
+        id: Some(album.id),
+        name: album.name,
+        images: album.images,
+        artists: album.artists,
+        release_date: album.release_date,
+    };
+    let summary = summary.into_album().expect("album has an id");
+    (summary, tracks)
+}
+
+/// Spotify's top-items endpoints have accepted up to 50 results; ask for fewer
+/// if the account's API tier refuses that.
+async fn get_top<T: DeserializeOwned>(client: &WebApiClient, kind: &str, range: TopRange) -> Result<T, String> {
+    let url = format!("https://api.spotify.com/v1/me/top/{kind}");
+    let query = |limit: &str| {
+        vec![
+            ("limit".to_owned(), limit.to_owned()),
+            ("time_range".to_owned(), range.api_value().to_owned()),
+        ]
+    };
+    match client.get_json(&url, &query("30")).await {
+        Ok(value) => Ok(value),
+        Err(error) if error.contains("400") => client.get_json(&url, &query("10")).await,
+        Err(error) => Err(error),
+    }
+}
+
+async fn load_top(client: &WebApiClient, range: TopRange, events: &Sender<PlaybackEvent>) {
+    let tracks = get_top::<TopTracksResponse>(client, "tracks", range).await;
+    let artists = get_top::<TopArtistItems>(client, "artists", range).await;
+    let error = match (&tracks, &artists) {
+        (Err(error), _) | (_, Err(error)) => Some(error.clone()),
+        _ => None,
+    };
+    let tracks = tracks
+        .map(|response| response.items.into_iter().map(map_search_track).collect())
+        .unwrap_or_default();
+    let artists = artists
+        .map(|response| {
+            response
+                .items
+                .into_iter()
+                .filter_map(|artist| {
+                    Some(SpotifyArtist {
+                        image_url: select_image(&artist.images),
+                        id: artist.id?,
+                        name: artist.name,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = events.send(PlaybackEvent::TopItems {
+        range,
+        tracks,
+        artists,
+        error,
+    });
+}
+
+async fn load_recently_played(client: &WebApiClient, events: &Sender<PlaybackEvent>) {
+    let result = client
+        .get_json::<RecentlyPlayedResponse>(
+            "https://api.spotify.com/v1/me/player/recently-played",
+            &[("limit".to_owned(), "50".to_owned())],
+        )
+        .await;
+    let event = match result {
+        Ok(response) => {
+            let mut seen = std::collections::HashSet::new();
+            let tracks = response
+                .items
+                .into_iter()
+                .filter_map(|item| item.track)
+                .filter(|track| seen.insert(track.id.clone()))
+                .map(map_search_track)
+                .collect();
+            PlaybackEvent::RecentlyPlayed { tracks, error: None }
+        }
+        Err(error) => PlaybackEvent::RecentlyPlayed {
+            tracks: Vec::new(),
+            error: Some(if error.contains("403") {
+                MISSING_PERMISSION.to_owned()
+            } else {
+                error
+            }),
+        },
+    };
+    let _ = events.send(event);
+}
+
+async fn load_album(client: &WebApiClient, album_id: &str, events: &Sender<PlaybackEvent>) {
+    let url = format!("https://api.spotify.com/v1/albums/{album_id}");
+    let album = match client.get_json::<AlbumResponse>(&url, &[]).await {
+        Ok(album) => album,
+        Err(error) => {
+            let _ = events.send(PlaybackEvent::AlbumPage {
+                album_id: album_id.to_owned(),
+                name: String::new(),
+                artist: String::new(),
+                artist_id: None,
+                year: None,
+                image_url: None,
+                tracks: Vec::new(),
+                error: Some(format!("Could not load the album: {error}")),
+            });
+            return;
+        }
+    };
+    // Long albums list their tracks over several pages.
+    let mut extra = Vec::new();
+    let mut next = album.tracks.next.clone();
+    let mut pages = 0;
+    while let Some(url) = next.take() {
+        if pages >= 10 {
+            break;
+        }
+        match client.get_json::<AlbumTrackPage>(&url, &[]).await {
+            Ok(page) => {
+                extra.extend(page.items);
+                next = page.next;
+                pages += 1;
+            }
+            Err(error) => {
+                log::debug!("Album track pagination stopped early: {error}");
+                break;
+            }
+        }
+    }
+    let artist_id = album.artists.first().and_then(|artist| artist.id.clone());
+    let (summary, tracks) = album_tracks_from_response(album, extra);
+    let _ = events.send(PlaybackEvent::AlbumPage {
+        album_id: summary.id,
+        name: summary.name,
+        artist: summary.artist,
+        artist_id,
+        year: summary.year,
+        image_url: summary.image_url,
+        tracks,
+        error: None,
+    });
+}
+
+/// Builds an artist page. Spotify's own artist metadata (through Librespot)
+/// still has an artist's top tracks and albums, which the Web API stopped
+/// giving to apps in development mode in February 2026; the Web API's search
+/// fills in whatever that misses.
+async fn load_artist(
+    client: &WebApiClient,
+    session: &Session,
+    artist_id: &str,
+    name: &str,
+    events: &Sender<PlaybackEvent>,
+) {
+    let mut name = name.to_owned();
+    let mut image_url = None;
+    let mut tracks = Vec::new();
+    let mut albums = Vec::new();
+
+    let metadata = match SpotifyId::from_base62(artist_id) {
+        Ok(id) => ArtistMetadata::get(session, &SpotifyUri::Artist { id })
+            .await
+            .map_err(|error| log::debug!("Spotify artist metadata failed: {error}"))
+            .ok(),
+        Err(_) => None,
+    };
+    if let Some(artist) = &metadata {
+        if !artist.name.trim().is_empty() {
+            name = artist.name.clone();
+        }
+        image_url = metadata_image_url(&artist.portraits)
+            .or_else(|| metadata_image_url(&artist.portrait_group));
+        let top = artist.top_tracks.for_country(&session.country());
+        let top_ids = top.iter().take(10).cloned().collect::<Vec<_>>();
+        tracks = tracks_from_metadata(session, top_ids).await;
+        let album_uris = artist
+            .albums_current()
+            .chain(artist.singles_current())
+            .take(18)
+            .cloned()
+            .collect::<Vec<_>>();
+        albums = albums_from_metadata(session, album_uris).await;
+    }
+
+    if image_url.is_none() || name.trim().is_empty() {
+        let url = format!("https://api.spotify.com/v1/artists/{artist_id}");
+        if let Ok(artist) = client.get_json::<SearchArtist>(&url, &[]).await {
+            image_url = image_url.or_else(|| select_image(&artist.images));
+            if name.trim().is_empty() {
+                name = artist.name;
+            }
+        }
+    }
+    let quoted = name.replace('"', "");
+    if tracks.is_empty() && !quoted.trim().is_empty() {
+        let params = vec![
+            ("q".to_owned(), format!("artist:\"{quoted}\"")),
+            ("type".to_owned(), "track".to_owned()),
+            ("limit".to_owned(), "10".to_owned()),
+        ];
+        if let Ok(response) = client
+            .get_json::<SearchResponse>("https://api.spotify.com/v1/search", &params)
+            .await
+        {
+            tracks = response
+                .tracks
+                .items
+                .into_iter()
+                .filter(|track| {
+                    track
+                        .artists
+                        .iter()
+                        .any(|artist| artist.id.as_deref() == Some(artist_id))
+                })
+                .map(map_search_track)
+                .collect();
+        }
+    }
+    if albums.is_empty() {
+        let url = format!("https://api.spotify.com/v1/artists/{artist_id}/albums");
+        let params = vec![
+            ("include_groups".to_owned(), "album,single".to_owned()),
+            ("limit".to_owned(), "10".to_owned()),
+        ];
+        albums = match client.get_json::<AlbumPage>(&url, &params).await {
+            Ok(page) => page.items.into_iter().filter_map(SearchAlbum::into_album).collect(),
+            Err(_) if !quoted.trim().is_empty() => {
+                let params = vec![
+                    ("q".to_owned(), format!("artist:\"{quoted}\"")),
+                    ("type".to_owned(), "album".to_owned()),
+                    ("limit".to_owned(), "10".to_owned()),
+                ];
+                client
+                    .get_json::<AlbumSearchResponse>("https://api.spotify.com/v1/search", &params)
+                    .await
+                    .map(|response| {
+                        response
+                            .albums
+                            .items
+                            .into_iter()
+                            .filter(|album| {
+                                album
+                                    .artists
+                                    .iter()
+                                    .any(|artist| artist.id.as_deref() == Some(artist_id))
+                            })
+                            .filter_map(SearchAlbum::into_album)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        };
+    }
+
+    let error = (tracks.is_empty() && albums.is_empty())
+        .then(|| "Spotify did not return any songs or albums for this artist.".to_owned());
+    let _ = events.send(PlaybackEvent::ArtistPage {
+        artist_id: artist_id.to_owned(),
+        name,
+        image_url,
+        tracks,
+        albums,
+        error,
+    });
+}
+
+/// Starts a radio from a song, the way Spotify's own apps do: Spotify makes a
+/// playlist of related songs for the seed, which Oynx then resolves.
+async fn song_radio(session: &Session, track_id: &str) -> Result<Vec<SpotifyTrack>, String> {
+    let id = SpotifyId::from_base62(track_id)
+        .map_err(|error| format!("Invalid Spotify track ID: {error}"))?;
+    let seed = SpotifyUri::Track { id };
+    let response = session
+        .spclient()
+        .get_radio_for_track(&seed)
+        .await
+        .map_err(|error| format!("Spotify could not start a radio for this song: {error}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&response)
+        .map_err(|error| format!("Could not read Spotify's radio response: {error}"))?;
+    let playlist_uri = value
+        .get("mediaItems")
+        .and_then(|items| items.as_array())
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("uri"))
+        .and_then(|uri| uri.as_str())
+        .ok_or_else(|| "Spotify has no radio for this song yet.".to_owned())?;
+    let context = session
+        .spclient()
+        .get_context(playlist_uri)
+        .await
+        .map_err(|error| format!("Could not load the song radio: {error}"))?;
+    let mut uris = context
+        .pages
+        .iter()
+        .flat_map(|page| page.tracks.iter())
+        .filter_map(|track| track.uri.clone())
+        .collect::<Vec<_>>();
+    if uris.is_empty() {
+        // Some contexts only point at their first page; load it.
+        let page_url = context
+            .pages
+            .iter()
+            .find_map(|page| page.page_url.clone().or_else(|| page.next_page_url.clone()));
+        if let Some(page_url) = page_url
+            && let Ok(page) = session.spclient().get_next_page(&page_url).await
+            && let Ok(page) = serde_json::from_slice::<serde_json::Value>(&page)
+        {
+            uris = page
+                .get("tracks")
+                .and_then(|tracks| tracks.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|track| track.get("uri").and_then(|uri| uri.as_str()))
+                .map(str::to_owned)
+                .collect();
+        }
+    }
+    let mut ids = vec![seed];
+    for uri in uris {
+        if let Ok(uri @ SpotifyUri::Track { .. }) = SpotifyUri::from_uri(&uri)
+            && !ids.contains(&uri)
+        {
+            ids.push(uri);
+        }
+        if ids.len() >= 50 {
+            break;
+        }
+    }
+    Ok(tracks_from_metadata(session, ids).await)
+}
+
+async fn track_metadata(session: &Session, track_id: &str) -> Option<TrackMetadata> {
+    let id = SpotifyId::from_base62(track_id).ok()?;
+    TrackMetadata::get(session, &SpotifyUri::Track { id })
+        .await
+        .map_err(|error| log::debug!("Spotify track metadata failed: {error}"))
+        .ok()
+}
+
+/// Fetches Spotify's metadata for several tracks at once, keeping their order.
+async fn tracks_from_metadata(session: &Session, uris: Vec<SpotifyUri>) -> Vec<SpotifyTrack> {
+    let permits = Arc::new(Semaphore::new(8));
+    let mut jobs = Vec::new();
+    for uri in uris {
+        let session = session.clone();
+        let permits = permits.clone();
+        jobs.push(tokio::spawn(async move {
+            let _permit = permits.acquire_owned().await.ok()?;
+            let track = TrackMetadata::get(&session, &uri).await.ok()?;
+            spotify_track_from_metadata(&track)
+        }));
+    }
+    let mut tracks = Vec::new();
+    for job in jobs {
+        if let Ok(Some(track)) = job.await {
+            tracks.push(track);
+        }
+    }
+    tracks
+}
+
+async fn albums_from_metadata(session: &Session, uris: Vec<SpotifyUri>) -> Vec<SpotifyAlbum> {
+    let permits = Arc::new(Semaphore::new(8));
+    let mut jobs = Vec::new();
+    for uri in uris {
+        let session = session.clone();
+        let permits = permits.clone();
+        jobs.push(tokio::spawn(async move {
+            let _permit = permits.acquire_owned().await.ok()?;
+            let album = AlbumMetadata::get(&session, &uri).await.ok()?;
+            Some(SpotifyAlbum {
+                id: album.id.to_id().ok()?,
+                name: album.name.clone(),
+                artist: album
+                    .artists
+                    .iter()
+                    .map(|artist| artist.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                year: Some(album.date.0.year()).filter(|year| *year > 1000),
+                image_url: metadata_image_url(&album.covers)
+                    .or_else(|| metadata_image_url(&album.cover_group)),
+            })
+        }));
+    }
+    let mut albums = Vec::new();
+    for job in jobs {
+        if let Ok(Some(album)) = job.await {
+            albums.push(album);
+        }
+    }
+    albums
+}
+
+fn spotify_track_from_metadata(track: &TrackMetadata) -> Option<SpotifyTrack> {
+    let id = track.id.to_id().ok()?;
+    if track.name.trim().is_empty() {
+        return None;
+    }
+    Some(SpotifyTrack {
+        id,
+        title: track.name.clone(),
+        artist: track
+            .artists
+            .iter()
+            .map(|artist| artist.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        artist_id: track.artists.first().and_then(|artist| artist.id.to_id().ok()),
+        album: track.album.name.clone(),
+        album_id: track.album.id.to_id().ok(),
+        duration_ms: u32::try_from(track.duration).unwrap_or_default(),
+        image_url: metadata_image_url(&track.album.covers)
+            .or_else(|| metadata_image_url(&track.album.cover_group)),
+    })
+}
+
+/// Picks a cover of about 300 pixels from Spotify's image metadata.
+fn metadata_image_url(images: &librespot::metadata::image::Images) -> Option<String> {
+    use librespot::metadata::image::ImageSize;
+    let image = images
+        .iter()
+        .find(|image| image.size == ImageSize::DEFAULT)
+        .or_else(|| images.iter().find(|image| image.size == ImageSize::LARGE))
+        .or_else(|| images.first())?;
+    let id = image.id.to_base16().ok()?;
+    Some(format!("https://i.scdn.co/image/{id}"))
+}
+
+fn spotify_role_label(role: ArtistRole) -> Option<&'static str> {
+    match role {
+        ArtistRole::ARTIST_ROLE_FEATURED_ARTIST => Some("Featuring"),
+        ArtistRole::ARTIST_ROLE_REMIXER => Some("Remixed by"),
+        ArtistRole::ARTIST_ROLE_COMPOSER => Some("Composed by"),
+        ArtistRole::ARTIST_ROLE_CONDUCTOR => Some("Conducted by"),
+        ArtistRole::ARTIST_ROLE_ORCHESTRA => Some("Performed by"),
+        _ => None,
+    }
+}
+
+/// Puts a track after the current one, or at the end of the queue. With
+/// nothing queued, the track simply starts playing.
+fn enqueue(player: &mut ConnectedPlayer, track_id: String, next: bool, events: &Sender<PlaybackEvent>) {
+    let Some(current) = player.current_index.filter(|index| *index < player.queue.len()) else {
+        player.queue = vec![track_id.clone()];
+        player.original_queue = player.queue.clone();
+        player.current_index = Some(0);
+        if let Err(error) = load_track(player, &track_id, true, 0) {
+            let _ = events.send(PlaybackEvent::Error(error));
+        }
+        return;
+    };
+    let current_id = player.queue[current].clone();
+    if next {
+        player.queue.insert(current + 1, track_id.clone());
+        let position = player
+            .original_queue
+            .iter()
+            .position(|id| *id == current_id)
+            .map_or(player.original_queue.len(), |index| index + 1);
+        player.original_queue.insert(position, track_id);
+    } else {
+        player.queue.push(track_id.clone());
+        player.original_queue.push(track_id);
     }
 }
 
@@ -2509,6 +3480,67 @@ mod tests {
             Some("track-id")
         );
         assert!(response.items[1].track.is_none());
+    }
+
+    #[test]
+    fn album_response_gives_every_track_the_album_cover_and_ids() {
+        let album: AlbumResponse = serde_json::from_value(serde_json::json!({
+            "id": "album-1",
+            "name": "An Album",
+            "release_date": "2019-11-29",
+            "artists": [{"id": "artist-1", "name": "Artist"}],
+            "images": [{"url": "https://i.scdn.co/image/cover", "width": 300, "height": 300}],
+            "tracks": {
+                "items": [
+                    {"id": "track-1", "name": "One", "duration_ms": 1000,
+                     "artists": [{"id": "artist-1", "name": "Artist"}, {"id": "artist-2", "name": "Guest"}]},
+                    {"id": null, "name": "Unavailable", "duration_ms": 1000, "artists": []}
+                ],
+                "next": "https://api.spotify.com/v1/albums/album-1/tracks?offset=50"
+            }
+        }))
+        .expect("album response should deserialize");
+        let extra = vec![AlbumTrack {
+            id: Some("track-2".to_owned()),
+            name: "Two".to_owned(),
+            duration_ms: 2000,
+            artists: Vec::new(),
+        }];
+        let (summary, tracks) = album_tracks_from_response(album, extra);
+        assert_eq!(summary.year, Some(2019));
+        assert_eq!(summary.artist, "Artist");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].artist, "Artist, Guest");
+        assert_eq!(tracks[0].artist_id.as_deref(), Some("artist-1"));
+        assert_eq!(tracks[1].album_id.as_deref(), Some("album-1"));
+        assert_eq!(
+            tracks[1].image_url.as_deref(),
+            Some("https://i.scdn.co/image/cover")
+        );
+    }
+
+    #[test]
+    fn search_tracks_keep_artist_and_album_ids() {
+        let track: SearchTrack = serde_json::from_value(serde_json::json!({
+            "id": "track-1",
+            "name": "Song",
+            "duration_ms": 1000,
+            "artists": [{"id": "artist-1", "name": "Artist"}],
+            "album": {"id": "album-1", "name": "Album", "images": []}
+        }))
+        .expect("track should deserialize");
+        let track = map_search_track(track);
+        assert_eq!(track.artist_id.as_deref(), Some("artist-1"));
+        assert_eq!(track.album_id.as_deref(), Some("album-1"));
+    }
+
+    #[test]
+    fn optional_scopes_are_requested_but_not_required() {
+        let requested = requested_web_api_scopes();
+        assert!(requested.contains(&"user-read-recently-played"));
+        assert!(requested.contains(&"playlist-modify-private"));
+        let old_grant = WEB_API_SCOPES.iter().map(|scope| (*scope).to_owned()).collect::<Vec<_>>();
+        assert!(has_scopes(&old_grant, WEB_API_SCOPES));
     }
 
     #[test]
