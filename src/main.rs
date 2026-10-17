@@ -1914,6 +1914,13 @@ impl OynxApp {
         self.spotify.load_artist(artist_id, name);
     }
 
+    /// Opens the page of the song's main artist, the first one credited.
+    fn open_track_artist(&mut self, track: &Track) {
+        if let Some(artist_id) = track.artist_id.clone() {
+            self.open_artist(artist_id, primary_artist(&track.artist).to_owned());
+        }
+    }
+
     fn open_album(&mut self, album_id: String, name: String, artist: String) {
         if !self.spotify_ready() {
             return;
@@ -2104,11 +2111,10 @@ impl OynxApp {
             }
         }
         if ready
-            && let Some(artist_id) = track.artist_id.clone()
+            && track.artist_id.is_some()
             && menu_item(ui, Icon::Search, "Go to artist", false).clicked()
         {
-            let name = track.artist.split(", ").next().unwrap_or_default().to_owned();
-            self.open_artist(artist_id, name);
+            self.open_track_artist(track);
             ui.close();
         }
         if ready
@@ -2761,15 +2767,20 @@ impl OynxApp {
             mix(pal().text, pal().accent, current_t),
             title_right - text_x,
         );
-        paint_text(
-            painter,
+        let (_, artist_clicked) = paint_artist_link(
+            ui,
+            ui.id().with(("artist", index)),
             egui::pos2(text_x, y + 2.0),
             egui::Align2::LEFT_TOP,
-            &track.artist,
+            &track,
             egui::FontId::proportional(12.0),
             mix(pal().muted, pal().text, hover),
             title_right - text_x,
         );
+        if artist_clicked {
+            self.open_track_artist(&track);
+        }
+        let painter = ui.painter();
         if columns.album > 0.0 {
             paint_text(
                 painter,
@@ -2815,7 +2826,7 @@ impl OynxApp {
             .frame(menu_frame())
             .show(|ui| self.track_menu(ui, &track, track_id.as_deref()));
 
-        let mut like_clicked = more_clicked;
+        let mut like_clicked = more_clicked || artist_clicked;
         let like_id = ui.id().with(("like", index));
         let like_scale = pop_scale(ui, like_id.with("pop"), liked, 0.35);
         let heart_alpha = if liked { 1.0 } else { hover };
@@ -2869,7 +2880,8 @@ impl OynxApp {
             egui::vec2(ui.available_width(), 56.0),
             egui::Sense::click(),
         );
-        let hover = hover_t(ui, &response);
+        // The artist link sits on top, so follow the pointer rather than `hovered`.
+        let hover = animate(ui, response.id.with("hover"), ui.rect_contains_pointer(rect), ANIM_FAST);
         if hover > 0.0 {
             ui.painter()
                 .rect_filled(rect, RADIUS_SM, pal().surface_raised.gamma_multiply(hover));
@@ -2901,15 +2913,19 @@ impl OynxApp {
             if current { pal().accent } else { pal().text },
             max_width,
         );
-        paint_text(
-            painter,
+        let (_, artist_clicked) = paint_artist_link(
+            ui,
+            response.id.with("artist"),
             egui::pos2(text_x, rect.center().y + 2.0),
             egui::Align2::LEFT_TOP,
-            &track.artist,
+            track,
             egui::FontId::proportional(12.0),
             pal().muted,
             max_width,
         );
+        if artist_clicked {
+            self.open_track_artist(track);
+        }
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
@@ -5150,6 +5166,7 @@ impl OynxApp {
         let ui = &mut panel;
         let mut search = None;
         let mut retry = false;
+        let mut artist_page = false;
         egui::ScrollArea::vertical()
             .id_salt("credits")
             .auto_shrink([false, false])
@@ -5159,9 +5176,20 @@ impl OynxApp {
                     egui::RichText::new(&track.title).font(font_light(30.0)).color(pal().text),
                 ));
                 ui.add_space(4.0);
-                ui.add(egui::Label::new(
-                    egui::RichText::new(&track.artist).font(font_light(21.0)).color(pal().muted),
-                ));
+                let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), 26.0));
+                let (_, artist_clicked) = paint_artist_link(
+                    ui,
+                    ui.id().with("credits_artist"),
+                    rect.left_top(),
+                    egui::Align2::LEFT_TOP,
+                    &track,
+                    font_light(21.0),
+                    pal().muted,
+                    rect.width(),
+                );
+                if artist_clicked {
+                    artist_page = true;
+                }
                 ui.add_space(26.0);
                 let state = track_id.as_ref().and_then(|id| self.credits.get(id));
                 match state {
@@ -5240,6 +5268,9 @@ impl OynxApp {
         if let Some(query) = search {
             self.search_for(&query);
         }
+        if artist_page {
+            self.open_track_artist(&track);
+        }
     }
 
     fn draw_lyrics(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -5265,15 +5296,19 @@ impl OynxApp {
                 pal().text,
                 rect.width(),
             );
-            let artist = paint_text(
-                &painter,
+            let (artist, artist_clicked) = paint_artist_link(
+                ui,
+                ui.id().with("lyrics_artist"),
                 egui::pos2(rect.left(), title.bottom() + 8.0),
                 egui::Align2::LEFT_TOP,
-                &track.artist,
+                &track,
                 font_light(21.0),
                 pal().muted,
                 rect.width(),
             );
+            if artist_clicked {
+                self.open_track_artist(&track);
+            }
             painter.text(
                 egui::pos2(rect.left(), artist.bottom() + 28.0),
                 egui::Align2::LEFT_TOP,
@@ -5630,7 +5665,8 @@ impl OynxApp {
             egui::vec2(ui.available_width(), 64.0),
             egui::Sense::click(),
         );
-        let hover = hover_t(ui, &response);
+        // The artist link sits on top, so follow the pointer rather than `hovered`.
+        let hover = animate(ui, response.id.with("hover"), ui.rect_contains_pointer(rect), ANIM_FAST);
         let fill = if current { 1.0 } else { hover * 0.6 };
         if fill > 0.0 {
             ui.painter()
@@ -5680,15 +5716,19 @@ impl OynxApp {
             pal().text,
             max_width,
         );
-        paint_text(
-            painter,
+        let (_, artist_clicked) = paint_artist_link(
+            ui,
+            response.id.with("artist"),
             egui::pos2(text_x, y + 3.0),
             egui::Align2::LEFT_TOP,
-            &track.artist,
+            track,
             egui::FontId::proportional(12.5),
             pal().muted,
             max_width,
         );
+        if artist_clicked {
+            self.open_track_artist(track);
+        }
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
@@ -5746,15 +5786,19 @@ impl OynxApp {
             pal().text.gamma_multiply(enter),
             text_width,
         );
-        let artist = paint_text(
-            ui.painter(),
+        let (artist, artist_clicked) = paint_artist_link(
+            ui,
+            id.with("artist"),
             egui::pos2(text_x, top + 44.0 + lift * 1.5),
             egui::Align2::LEFT_CENTER,
-            &track.artist,
+            &track,
             egui::FontId::proportional(13.0),
             pal().muted.gamma_multiply(enter),
             text_width,
         );
+        if artist_clicked {
+            self.open_track_artist(&track);
+        }
         let heart_x = title.right().max(artist.right()) + 56.0;
         let liked = self
             .current_track_id()
@@ -6872,6 +6916,51 @@ fn text_link(ui: &mut egui::Ui, text: &str) -> egui::Response {
         mix(pal().muted, pal().text, hover),
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The main artist of a song credited as "First, Second".
+fn primary_artist(artists: &str) -> &str {
+    artists.split(", ").next().unwrap_or_default()
+}
+
+/// Paints a song's artist line. When the song links to an artist page the line
+/// brightens and underlines on hover, and the returned flag says it was clicked.
+fn paint_artist_link(
+    ui: &egui::Ui,
+    id: egui::Id,
+    pos: egui::Pos2,
+    align: egui::Align2,
+    track: &Track,
+    font: egui::FontId,
+    color: egui::Color32,
+    max_width: f32,
+) -> (egui::Rect, bool) {
+    if track.artist_id.is_none() {
+        let rect = paint_text(ui.painter(), pos, align, &track.artist, font, color, max_width);
+        return (rect, false);
+    }
+    let layout = |color| {
+        let mut job = egui::text::LayoutJob::simple_singleline(track.artist.clone(), font.clone(), color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(max_width.max(1.0));
+        ui.painter().layout_job(job)
+    };
+    let rect = align.anchor_size(pos, layout(color).size());
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let hover = hover_t(ui, &response);
+    // Keep any fade the caller applied while brightening towards the text color.
+    let color = mix(color, pal().text.gamma_multiply(color.a() as f32 / 255.0), hover);
+    ui.painter().galley(rect.min, layout(color), color);
+    if hover > 0.0 {
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 1.0,
+            egui::Stroke::new(1.0, color.gamma_multiply(hover)),
+        );
+    }
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("Go to {}", primary_artist(&track.artist)));
+    (rect, response.clicked())
 }
 
 fn credits_heading(ui: &mut egui::Ui, text: &str) {
