@@ -530,6 +530,10 @@ struct OynxApp {
     settings_message: Option<String>,
     page_key: (Section, Option<String>),
     page_entered: Instant,
+    /// Last frame's scroll offset and scrollable overflow of the page's track list.
+    track_scroll: (f32, f32),
+    /// Whether the Liked Songs or playlist header is shrunk to its slim bar.
+    header_collapsed: bool,
     audio: AudioTaps,
     /// UI copy of the equalizer curve; changes are pushed to `audio.equalizer`.
     eq_settings: EqualizerSettings,
@@ -888,6 +892,8 @@ impl OynxApp {
             settings_message: None,
             page_key: (Section::Home, None),
             page_entered: Instant::now(),
+            track_scroll: (0.0, 0.0),
+            header_collapsed: false,
             audio: audio.clone(),
             eq_settings,
             eq_unsaved: false,
@@ -2663,7 +2669,7 @@ impl OynxApp {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if scroll {
-                egui::ScrollArea::vertical()
+                let output = egui::ScrollArea::vertical()
                     .id_salt("track_table")
                     .auto_shrink([false, false])
                     .show_rows(ui, TRACK_ROW_HEIGHT, indices.len(), |ui, rows| {
@@ -2673,6 +2679,8 @@ impl OynxApp {
                             }
                         }
                     });
+                let overflow = (output.content_size.y - output.inner_rect.height()).max(0.0);
+                self.track_scroll = (output.state.offset.y, overflow);
             } else {
                 for &index in indices {
                     self.draw_track_row(ui, index, columns);
@@ -2957,6 +2965,135 @@ impl OynxApp {
         ui.add_space(20.0);
     }
 
+    /// The Liked Songs and playlist header, with its play and refresh buttons.
+    /// Once the track list scrolls it shrinks into a slim bar holding the
+    /// artwork, title and play button, and it grows back at the top of the list.
+    /// Returns whether play and refresh were clicked.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_collapsing_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        art: Option<(Artwork, Option<String>)>,
+        kind: &str,
+        title: &str,
+        subtitle: &str,
+        play: Option<&str>,
+        refresh: bool,
+    ) -> (bool, bool) {
+        const ART: f32 = 168.0;
+        const SLIM_ART: f32 = 48.0;
+        const SLIM_HEIGHT: f32 = 72.0;
+        const COLLAPSE_AFTER: f32 = 32.0;
+        let controls = play.is_some() || refresh;
+        let full_height = ART + 20.0 + if controls { 52.0 + 16.0 } else { 0.0 };
+
+        // The track list reports its scroll position after it is drawn, so this
+        // reads last frame's. Collapse only when the list stays scrollable with
+        // the header shrunk, so the freed room can't bounce it back open.
+        let (offset, overflow) = std::mem::take(&mut self.track_scroll);
+        self.header_collapsed = if self.header_collapsed {
+            offset > 1.0
+        } else {
+            offset > COLLAPSE_AFTER && overflow > full_height - SLIM_HEIGHT + COLLAPSE_AFTER
+        };
+        let t = animate(
+            ui,
+            egui::Id::new(("collection_header", self.page_key.0 as u8, &self.page_key.1)),
+            self.header_collapsed,
+            ANIM_MEDIUM,
+        );
+        let lerp = |from: f32, to: f32| egui::lerp(from..=to, t);
+
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), lerp(full_height, SLIM_HEIGHT)),
+            egui::Sense::hover(),
+        );
+        let clip = rect.intersect(ui.clip_rect());
+        let art_size = lerp(ART, SLIM_ART);
+        let art_rect = egui::Rect::from_min_size(
+            rect.min + egui::vec2(0.0, lerp(0.0, 6.0)),
+            egui::Vec2::splat(art_size),
+        );
+        let radius = egui::CornerRadius::same(RADIUS_MD);
+        match art {
+            Some((artwork, url)) => self.paint_artwork(ui, art_rect, &artwork, url.as_deref(), radius),
+            None => Self::paint_liked_tile(ui.painter(), art_rect, radius),
+        }
+
+        let painter = ui.painter_at(clip);
+        let text_x = art_rect.right() + lerp(24.0, 16.0);
+        let play_size = lerp(52.0, 44.0);
+        let max_width = rect.right() - text_x - lerp(0.0, play_size + 16.0);
+        let full_title = if title.chars().count() > 22 { 34.0 } else { 46.0 };
+        let title_size = lerp(full_title, 20.0);
+        let title_bottom = rect.top() + lerp(ART - 30.0, 43.0);
+        // The overline and subtitle fade out in the first half of the collapse.
+        let details = pal().text.gamma_multiply((1.0 - 2.0 * t).max(0.0));
+        if t < 0.5 {
+            painter.text(
+                egui::pos2(text_x, title_bottom - title_size - 14.0),
+                egui::Align2::LEFT_BOTTOM,
+                kind,
+                font_medium(13.0),
+                details,
+            );
+            paint_text(
+                &painter,
+                egui::pos2(text_x, title_bottom + 26.0),
+                egui::Align2::LEFT_BOTTOM,
+                subtitle,
+                egui::FontId::proportional(13.0),
+                pal().muted.gamma_multiply((1.0 - 2.0 * t).max(0.0)),
+                max_width,
+            );
+        }
+        paint_text(
+            &painter,
+            egui::pos2(text_x, title_bottom),
+            egui::Align2::LEFT_BOTTOM,
+            title,
+            font_light(title_size),
+            pal().text,
+            max_width,
+        );
+
+        // The play button slides from under the artwork into the bar's right end.
+        let controls_top = rect.top() + ART + 20.0;
+        let mut play_clicked = false;
+        if let Some(hover) = play {
+            let play_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    lerp(rect.left(), rect.right() - play_size - 4.0),
+                    lerp(controls_top, rect.top() + 6.0 + (SLIM_ART - play_size) * 0.5),
+                ),
+                egui::Vec2::splat(play_size),
+            );
+            play_clicked = ui
+                .put(play_rect, |ui: &mut egui::Ui| play_circle_button(ui, play_size))
+                .on_hover_text(hover)
+                .clicked();
+        }
+        let mut refresh_clicked = false;
+        if refresh && t < 1.0 {
+            let left = rect.left() + if play.is_some() { 52.0 + 8.0 } else { 0.0 };
+            let refresh_rect = egui::Rect::from_min_max(
+                egui::pos2(left, controls_top),
+                egui::pos2(rect.right(), controls_top + 52.0),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(refresh_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.set_clip_rect(clip);
+                    ui.multiply_opacity(1.0 - t);
+                    refresh_clicked = pill_button(ui, "Refresh", ButtonKind::Ghost).clicked();
+                },
+            );
+        }
+        (play_clicked, refresh_clicked)
+    }
+
     fn draw_playlist_page(&mut self, ui: &mut egui::Ui, name: &str) {
         if text_icon_button(ui, Icon::ChevronLeft, "Playlists").clicked() {
             self.playlist_name = None;
@@ -2975,7 +3112,19 @@ impl OynxApp {
             .as_ref()
             .map(|playlist| (playlist.artwork, playlist.image_url.clone()))
             .or(Some((Self::artwork_for_index(0), None)));
-        self.draw_collection_header(ui, art, "Playlist", name, &subtitle);
+        let has_tracks = !self.playlist_loading && self.playlist_error.is_none() && !self.tracks.is_empty();
+        let (play, _) = self.draw_collapsing_header(
+            ui,
+            art,
+            "Playlist",
+            name,
+            &subtitle,
+            has_tracks.then_some("Play"),
+            false,
+        );
+        if play {
+            self.play_track(0);
+        }
 
         if self.playlist_loading {
             Self::muted_note(ui, "Loading playlist tracks…");
@@ -2984,10 +3133,6 @@ impl OynxApp {
         } else if self.tracks.is_empty() {
             Self::muted_note(ui, "This playlist has no playable tracks.");
         } else {
-            if play_circle_button(ui, 52.0).on_hover_text("Play").clicked() {
-                self.play_track(0);
-            }
-            ui.add_space(16.0);
             let indices = (0..self.tracks.len()).collect::<Vec<_>>();
             self.draw_track_table(ui, &indices, true);
         }
@@ -3006,25 +3151,24 @@ impl OynxApp {
         } else {
             "Every track you’ve saved, in one place".to_owned()
         };
-        self.draw_collection_header(ui, None, "Playlist", "Liked Songs", &subtitle);
-
         let ready = self.connection_state == ConnectionState::Ready;
-        ui.horizontal(|ui| {
-            if !self.liked_songs.is_empty()
-                && play_circle_button(ui, 52.0).on_hover_text("Play all").clicked()
-            {
-                self.play_track(0);
-            }
-            if ready && self.liked_songs_loaded {
-                ui.add_space(8.0);
-                if pill_button(ui, "Refresh", ButtonKind::Ghost).clicked() {
-                    self.liked_songs_loaded = false;
-                    self.liked_songs_error = None;
-                    self.spotify.load_liked_songs();
-                }
-            }
-        });
-        ui.add_space(16.0);
+        let (play, refresh) = self.draw_collapsing_header(
+            ui,
+            None,
+            "Playlist",
+            "Liked Songs",
+            &subtitle,
+            (!self.liked_songs.is_empty()).then_some("Play all"),
+            ready && self.liked_songs_loaded,
+        );
+        if play {
+            self.play_track(0);
+        }
+        if refresh {
+            self.liked_songs_loaded = false;
+            self.liked_songs_error = None;
+            self.spotify.load_liked_songs();
+        }
 
         if let Some(error) = self.liked_songs_error.clone() {
             let mut retry = false;
@@ -6189,6 +6333,8 @@ impl OynxApp {
         if page_key != self.page_key {
             self.page_key = page_key;
             self.page_entered = Instant::now();
+            self.track_scroll = (0.0, 0.0);
+            self.header_collapsed = false;
         }
         let page_elapsed = self.page_entered.elapsed().as_secs_f32();
         let page_t = egui::emath::easing::cubic_out((page_elapsed / PAGE_TRANSITION).min(1.0));
